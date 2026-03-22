@@ -22,9 +22,10 @@
 #include <qbuem/core/task.hpp>
 #include <qbuem/crypto.hpp>
 #include <qbuem/url.hpp>          // qbuem::url_encode / url_decode
-#include <qbuem_json/qbuem_json.hpp>
 
+#include <chrono>
 #include <format>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -64,20 +65,46 @@ parse_query(std::string_view qs) {
     return m;
 }
 
-// JSON에서 문자열 필드 추출 (간단 파서)
-[[nodiscard]] inline std::string json_get_str(std::string_view json,
-                                               std::string_view key) {
-    auto k = std::format(R"("{}":")", key);
-    auto pos = json.find(k);
-    if (pos == std::string_view::npos) return {};
-    pos += k.size();
-    auto end = pos;
-    // 이스케이프 처리
-    while (end < json.size() && json[end] != '"') {
-        if (json[end] == '\\') ++end;
-        ++end;
+// JSON에서 필드 값 추출 — 문자열("key":"val")과 스칼라("key":123) 모두 지원
+[[nodiscard]] inline std::string json_get_field(std::string_view json,
+                                                 std::string_view key) {
+    // 문자열 형식 "key":"value" 먼저 시도
+    auto k_str = std::format(R"("{}":")", key);
+    auto pos   = json.find(k_str);
+    if (pos != std::string_view::npos) {
+        pos += k_str.size();
+        auto end = pos;
+        while (end < json.size() && json[end] != '"') {
+            if (json[end] == '\\') ++end;  // 이스케이프 문자 건너뜀
+            ++end;
+        }
+        return std::string{json.substr(pos, end - pos)};
     }
-    return std::string{json.substr(pos, end - pos)};
+    // 스칼라 형식 "key":value (숫자, boolean, null)
+    auto k_int = std::format(R"("{}":)", key);
+    pos = json.find(k_int);
+    if (pos != std::string_view::npos) {
+        pos += k_int.size();
+        // 공백 건너뜀
+        while (pos < json.size() && json[pos] == ' ') ++pos;
+        auto end = pos;
+        while (end < json.size() && json[end] != ',' &&
+               json[end] != '}' && json[end] != ']') {
+            ++end;
+        }
+        return std::string{json.substr(pos, end - pos)};
+    }
+    return {};
+}
+
+// 중첩 JSON 객체 내부 추출 ("key":{ ... })
+// 반환값: { 이후 내용 (닫는 괄호 포함 안 함)
+[[nodiscard]] inline std::string_view json_get_obj(std::string_view json,
+                                                    std::string_view key) {
+    auto k = std::format(R"("{}":{{)", key);
+    auto pos = json.find(k);
+    if (pos == std::string_view::npos) return json;  // fallback
+    return json.substr(pos + k.size());
 }
 
 inline std::string env_or(const char* name, std::string_view def = "") {
@@ -123,7 +150,7 @@ struct GoogleProvider {
             "https://oauth2.googleapis.com/token", body);
         if (!token_resp.ok()) co_return std::nullopt;
 
-        const auto access_token = detail::json_get_str(token_resp.body, "access_token");
+        const auto access_token = detail::json_get_field(token_resp.body, "access_token");
         if (access_token.empty()) co_return std::nullopt;
 
         // 2. 사용자 정보 조회
@@ -135,10 +162,10 @@ struct GoogleProvider {
         const auto& j = info_resp.body;
         co_return UserInfo{
             .provider    = "google",
-            .provider_id = detail::json_get_str(j, "sub"),
-            .email       = detail::json_get_str(j, "email"),
-            .name        = detail::json_get_str(j, "name"),
-            .avatar_url  = detail::json_get_str(j, "picture"),
+            .provider_id = detail::json_get_field(j, "sub"),
+            .email       = detail::json_get_field(j, "email"),
+            .name        = detail::json_get_field(j, "name"),
+            .avatar_url  = detail::json_get_field(j, "picture"),
         };
     }
 };
@@ -174,31 +201,30 @@ struct NaverProvider {
             "https://nid.naver.com/oauth2.0/token", body);
         if (!token_resp.ok()) co_return std::nullopt;
 
-        const auto access_token = detail::json_get_str(token_resp.body, "access_token");
+        const auto access_token = detail::json_get_field(token_resp.body, "access_token");
         if (access_token.empty()) co_return std::nullopt;
 
-        // 2. 사용자 정보 (Authorization Bearer)
-        // Naver userinfo는 GET + Authorization 헤더 필요 → https::get 확장 필요.
-        // 여기서는 HTTPS GET을 직접 구성합니다.
-        const std::string userinfo_url =
-            "https://openapi.naver.com/v1/nid/me";
+        // 2. 사용자 정보 — Authorization: Bearer 헤더로 전달 (URL 파라미터 노출 방지)
+        const std::string auth_header =
+            std::format("Authorization: Bearer {}\r\n", access_token);
         auto info_raw = co_await https::get(
-            userinfo_url + "?access_token=" + qbuem::url_encode(access_token));
+            "https://openapi.naver.com/v1/nid/me", auth_header);
+        if (!info_raw.ok()) co_return std::nullopt;
 
         // Naver 응답: {"resultcode":"00","message":"success","response":{...}}
         const auto& j = info_raw.body;
-        // response 객체 내부 추출
-        auto resp_start = j.find(R"("response":{)");
-        std::string resp_json;
-        if (resp_start != std::string::npos) {
-            resp_json = j.substr(resp_start + 12);
-        }
+        constexpr std::string_view kRespKey = R"("response":{)";
+        auto resp_start = j.find(kRespKey);
+        std::string_view resp_json = (resp_start != std::string::npos)
+            ? std::string_view{j}.substr(resp_start + kRespKey.size())
+            : std::string_view{j};
+
         co_return UserInfo{
             .provider    = "naver",
-            .provider_id = detail::json_get_str(resp_json.empty() ? j : resp_json, "id"),
-            .email       = detail::json_get_str(resp_json.empty() ? j : resp_json, "email"),
-            .name        = detail::json_get_str(resp_json.empty() ? j : resp_json, "name"),
-            .avatar_url  = detail::json_get_str(resp_json.empty() ? j : resp_json, "profile_image"),
+            .provider_id = detail::json_get_field(resp_json, "id"),
+            .email       = detail::json_get_field(resp_json, "email"),
+            .name        = detail::json_get_field(resp_json, "name"),
+            .avatar_url  = detail::json_get_field(resp_json, "profile_image"),
         };
     }
 };
@@ -232,7 +258,7 @@ struct KakaoProvider {
             "https://kauth.kakao.com/oauth/token", body);
         if (!token_resp.ok()) co_return std::nullopt;
 
-        const auto access_token = detail::json_get_str(token_resp.body, "access_token");
+        const auto access_token = detail::json_get_field(token_resp.body, "access_token");
         if (access_token.empty()) co_return std::nullopt;
 
         // 2. 사용자 정보
@@ -244,48 +270,60 @@ struct KakaoProvider {
         // 카카오 응답 구조:
         // {"id":1234,"kakao_account":{"email":"..","profile":{"nickname":"..","profile_image_url":".."}}}
         const auto& j = info_resp.body;
-        const auto id = detail::json_get_str(j, "id");
 
-        auto acc_start = j.find(R"("kakao_account":{)");
-        std::string acc_json = (acc_start != std::string::npos)
-            ? j.substr(acc_start + 17) : j;
+        // "id"는 정수 필드
+        const auto id = detail::json_get_field(j, "id");
 
-        auto prof_start = acc_json.find(R"("profile":{)");
-        std::string prof_json = (prof_start != std::string::npos)
-            ? acc_json.substr(prof_start + 11) : acc_json;
+        // 중첩 객체 접근: kakao_account → profile
+        auto acc_json  = detail::json_get_obj(j, "kakao_account");
+        auto prof_json = detail::json_get_obj(acc_json, "profile");
 
         co_return UserInfo{
             .provider    = "kakao",
             .provider_id = id,
-            .email       = detail::json_get_str(acc_json, "email"),
-            .name        = detail::json_get_str(prof_json, "nickname"),
-            .avatar_url  = detail::json_get_str(prof_json, "profile_image_url"),
+            .email       = detail::json_get_field(acc_json, "email"),
+            .name        = detail::json_get_field(prof_json, "nickname"),
+            .avatar_url  = detail::json_get_field(prof_json, "profile_image_url"),
         };
     }
 };
 
-// ── CSRF state 관리 (인메모리, TTL 10분) ─────────────────────────────────────
+// ── CSRF state 관리 (인메모리, TTL 10분, 스레드 안전) ────────────────────────
 
 namespace state_store {
 
-struct Entry { std::string value; int64_t exp; };
+struct Entry { int64_t exp; };
 inline std::unordered_map<std::string, Entry> g_states;
+inline std::mutex g_mutex;
+
+// 만료된 엔트리 정리 (내부용, mutex 보유 상태에서 호출)
+inline void purge_expired_locked(int64_t now) {
+    for (auto it = g_states.begin(); it != g_states.end(); ) {
+        if (it->second.exp < now) it = g_states.erase(it);
+        else ++it;
+    }
+}
 
 inline std::string issue() {
     using namespace std::chrono;
+    const int64_t now = duration_cast<seconds>(
+        system_clock::now().time_since_epoch()).count();
     auto state = qbuem::crypto::csrf_token(128);
-    int64_t exp = duration_cast<seconds>(
-        system_clock::now().time_since_epoch()).count() + 600;
-    g_states[state] = {state, exp};
+
+    std::lock_guard lock{g_mutex};
+    purge_expired_locked(now);
+    g_states[state] = {now + 600};
     return state;
 }
 
 inline bool verify_and_consume(std::string_view state) {
     using namespace std::chrono;
+    const int64_t now = duration_cast<seconds>(
+        system_clock::now().time_since_epoch()).count();
+
+    std::lock_guard lock{g_mutex};
     auto it = g_states.find(std::string{state});
     if (it == g_states.end()) return false;
-    int64_t now = duration_cast<seconds>(
-        system_clock::now().time_since_epoch()).count();
     bool valid = (it->second.exp >= now);
     g_states.erase(it);
     return valid;

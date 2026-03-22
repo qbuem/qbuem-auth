@@ -1,47 +1,4 @@
-# qbuem-auth — Full Source Reference
-> Auto-generated. All source files concatenated for LLM context.
-
----
-
-## CMakeLists.txt
-
-```cmake
-cmake_minimum_required(VERSION 3.20)
-project(qbuem-auth VERSION 1.0.0 LANGUAGES CXX)
-
-set(CMAKE_CXX_STANDARD 23)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
-
-include(FetchContent)
-
-set(QBUEM_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
-set(QBUEM_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(QBUEM_BUILD_BENCH    OFF CACHE BOOL "" FORCE)
-set(QBUEM_INSTALL        OFF CACHE BOOL "" FORCE)
-
-FetchContent_Declare(
-    qbuem_stack
-    GIT_REPOSITORY https://github.com/qbuem/qbuem-stack.git
-    GIT_TAG        main
-)
-FetchContent_MakeAvailable(qbuem_stack)
-
-find_package(OpenSSL REQUIRED)
-
-add_library(qbuem_auth INTERFACE)
-target_include_directories(qbuem_auth INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(qbuem_auth INTERFACE
-    qbuem-stack::crypto
-    qbuem-stack::http
-    OpenSSL::SSL
-    OpenSSL::Crypto
-)
-add_library(qbuem-auth::auth ALIAS qbuem_auth)
-```
-
-
----
+# qbuem-auth — 전체 소스 코드
 
 ## src/auth/jwt.hpp
 
@@ -270,8 +227,6 @@ extract_bearer(std::string_view auth_header) noexcept {
 } // namespace qbuem_routine::jwt
 ```
 
----
-
 ## src/auth/https_client.hpp
 
 ```cpp
@@ -294,12 +249,15 @@ extract_bearer(std::string_view auth_header) noexcept {
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
+#include <charconv>
 #include <cstring>
 #include <format>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include <sys/eventfd.h>
 #include <unistd.h>
@@ -314,17 +272,17 @@ struct Response {
     bool        ok() const noexcept { return status >= 200 && status < 300; }
 };
 
-// ── OpenSSL 전역 초기화 (한 번만) ────────────────────────────────────────────
+// ── OpenSSL 전역 초기화 (한 번만, 스레드 안전) ───────────────────────────────
 
 namespace detail {
 
 inline void ssl_init() {
-    static bool done = false;
-    if (done) return;
-    done = true;
-    SSL_library_init();
-    SSL_load_error_strings();
-    OpenSSL_add_all_algorithms();
+    static std::once_flag flag;
+    std::call_once(flag, []() {
+        SSL_library_init();
+        SSL_load_error_strings();
+        OpenSSL_add_all_algorithms();
+    });
 }
 
 // ── 블로킹 HTTPS 요청 (별도 스레드에서 실행) ─────────────────────────────────
@@ -335,7 +293,8 @@ inline void ssl_init() {
     std::string_view method,
     std::string_view path,
     std::string_view body,
-    std::string_view content_type)
+    std::string_view content_type,
+    std::string_view extra_headers = "")
 {
     ssl_init();
 
@@ -363,13 +322,18 @@ inline void ssl_init() {
     // HTTP 요청 조합
     std::string req = std::format(
         "{} {} HTTP/1.1\r\n"
-        "Host: {}\r\n"
-        "Content-Type: {}\r\n"
-        "Content-Length: {}\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "{}",
-        method, path, host, content_type, body.size(), body);
+        "Host: {}\r\n",
+        method, path, host);
+
+    if (!content_type.empty())
+        req += std::format("Content-Type: {}\r\n", content_type);
+
+    req += std::format("Content-Length: {}\r\n", body.size());
+
+    if (!extra_headers.empty())
+        req += extra_headers;
+
+    req += std::format("Connection: close\r\n\r\n{}", body);
 
     BIO_write(bio, req.data(), static_cast<int>(req.size()));
     BIO_flush(bio);
@@ -403,6 +367,32 @@ inline void ssl_init() {
     return {status, std::move(resp_body)};
 }
 
+// URL 파싱 (host, port, path) 공통 헬퍼
+struct ParsedUrl {
+    std::string host;
+    uint16_t    port;
+    std::string path;
+};
+
+[[nodiscard]] inline ParsedUrl parse_url(std::string_view url) {
+    uint16_t port = 443;
+    if (url.starts_with("https://")) url.remove_prefix(8);
+    else if (url.starts_with("http://")) { url.remove_prefix(7); port = 80; }
+
+    auto slash = url.find('/');
+    std::string host{url.substr(0, slash)};
+    std::string path = (slash != std::string_view::npos) ? std::string{url.substr(slash)} : "/";
+
+    // 포트 오버라이드
+    if (auto colon = host.rfind(':'); colon != std::string::npos) {
+        std::from_chars(host.data() + colon + 1,
+                        host.data() + host.size(), port);
+        host.erase(colon);
+    }
+
+    return {std::move(host), port, std::move(path)};
+}
+
 } // namespace detail
 
 // ── eventfd Awaiter ───────────────────────────────────────────────────────────
@@ -431,47 +421,33 @@ struct EventFdAwaiter {
 
 /**
  * @brief URL 파싱 후 비동기 HTTPS POST 요청
- * @param url         전체 URL (https://host/path?query)
- * @param body        요청 바디
+ * @param url          전체 URL (https://host/path?query)
+ * @param body         요청 바디
  * @param content_type Content-Type 헤더 값
+ * @param extra_headers 추가 헤더 문자열 (각 줄 \r\n 으로 끝나야 함, 예: "Authorization: Bearer token\r\n")
  */
 [[nodiscard]] inline qbuem::Task<Response>
 post(std::string_view url, std::string_view body,
-     std::string_view content_type = "application/x-www-form-urlencoded")
+     std::string_view content_type  = "application/x-www-form-urlencoded",
+     std::string_view extra_headers = "")
 {
-    // URL 파싱 (host, port, path)
-    std::string_view u = url;
-    uint16_t port = 443;
-    if (u.starts_with("https://")) u.remove_prefix(8);
-    else if (u.starts_with("http://")) { u.remove_prefix(7); port = 80; }
+    auto [host, port, path] = detail::parse_url(url);
 
-    auto slash = u.find('/');
-    std::string host{u.substr(0, slash)};
-    std::string path = (slash != std::string_view::npos) ? std::string{u.substr(slash)} : "/";
-
-    // 포트 오버라이드
-    if (auto colon = host.rfind(':'); colon != std::string::npos) {
-        std::from_chars(host.data() + colon + 1,
-                        host.data() + host.size(), port);
-        host.erase(colon);
-    }
-
-    // eventfd 생성
     int efd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (efd < 0) co_return Response{0, "eventfd creation failed"};
 
     auto result = std::make_shared<Response>();
     std::string host_copy{host}, path_copy{path};
     std::string body_copy{body}, ct_copy{content_type};
+    std::string hdrs_copy{extra_headers};
 
-    // 블로킹 작업을 별도 스레드에서 실행
     std::thread([=, result]() mutable {
         *result = detail::do_https_blocking(host_copy, port, "POST",
-                                            path_copy, body_copy, ct_copy);
+                                            path_copy, body_copy, ct_copy, hdrs_copy);
         uint64_t one = 1;
         ::write(efd, &one, sizeof(one));
     }).detach();
 
-    // reactor 이벤트로 완료 대기
     co_await EventFdAwaiter{efd};
     ::close(efd);
     co_return *result;
@@ -479,31 +455,22 @@ post(std::string_view url, std::string_view body,
 
 /**
  * @brief 비동기 HTTPS GET 요청
+ * @param url          전체 URL (https://host/path?query)
+ * @param extra_headers 추가 헤더 문자열 (각 줄 \r\n 으로 끝나야 함)
  */
 [[nodiscard]] inline qbuem::Task<Response>
-get(std::string_view url)
+get(std::string_view url, std::string_view extra_headers = "")
 {
-    std::string_view u = url;
-    uint16_t port = 443;
-    if (u.starts_with("https://")) u.remove_prefix(8);
-    else if (u.starts_with("http://")) { u.remove_prefix(7); port = 80; }
-
-    auto slash = u.find('/');
-    std::string host{u.substr(0, slash)};
-    std::string path = (slash != std::string_view::npos) ? std::string{u.substr(slash)} : "/";
-
-    if (auto colon = host.rfind(':'); colon != std::string::npos) {
-        std::from_chars(host.data() + colon + 1,
-                        host.data() + host.size(), port);
-        host.erase(colon);
-    }
+    auto [host, port, path] = detail::parse_url(url);
 
     int efd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (efd < 0) co_return Response{0, "eventfd creation failed"};
+
     auto result = std::make_shared<Response>();
-    std::string h{host}, p{path};
+    std::string h{host}, p{path}, hdrs{extra_headers};
 
     std::thread([=, result]() mutable {
-        *result = detail::do_https_blocking(h, port, "GET", p, "", "");
+        *result = detail::do_https_blocking(h, port, "GET", p, "", "", hdrs);
         uint64_t one = 1;
         ::write(efd, &one, sizeof(one));
     }).detach();
@@ -515,8 +482,6 @@ get(std::string_view url)
 
 } // namespace qbuem_routine::https
 ```
-
----
 
 ## src/auth/oauth.hpp
 
@@ -545,9 +510,10 @@ get(std::string_view url)
 #include <qbuem/core/task.hpp>
 #include <qbuem/crypto.hpp>
 #include <qbuem/url.hpp>          // qbuem::url_encode / url_decode
-#include <qbuem_json/qbuem_json.hpp>
 
+#include <chrono>
 #include <format>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -587,20 +553,46 @@ parse_query(std::string_view qs) {
     return m;
 }
 
-// JSON에서 문자열 필드 추출 (간단 파서)
-[[nodiscard]] inline std::string json_get_str(std::string_view json,
-                                               std::string_view key) {
-    auto k = std::format(R"("{}":")", key);
-    auto pos = json.find(k);
-    if (pos == std::string_view::npos) return {};
-    pos += k.size();
-    auto end = pos;
-    // 이스케이프 처리
-    while (end < json.size() && json[end] != '"') {
-        if (json[end] == '\\') ++end;
-        ++end;
+// JSON에서 필드 값 추출 — 문자열("key":"val")과 스칼라("key":123) 모두 지원
+[[nodiscard]] inline std::string json_get_field(std::string_view json,
+                                                 std::string_view key) {
+    // 문자열 형식 "key":"value" 먼저 시도
+    auto k_str = std::format(R"("{}":")", key);
+    auto pos   = json.find(k_str);
+    if (pos != std::string_view::npos) {
+        pos += k_str.size();
+        auto end = pos;
+        while (end < json.size() && json[end] != '"') {
+            if (json[end] == '\\') ++end;  // 이스케이프 문자 건너뜀
+            ++end;
+        }
+        return std::string{json.substr(pos, end - pos)};
     }
-    return std::string{json.substr(pos, end - pos)};
+    // 스칼라 형식 "key":value (숫자, boolean, null)
+    auto k_int = std::format(R"("{}":)", key);
+    pos = json.find(k_int);
+    if (pos != std::string_view::npos) {
+        pos += k_int.size();
+        // 공백 건너뜀
+        while (pos < json.size() && json[pos] == ' ') ++pos;
+        auto end = pos;
+        while (end < json.size() && json[end] != ',' &&
+               json[end] != '}' && json[end] != ']') {
+            ++end;
+        }
+        return std::string{json.substr(pos, end - pos)};
+    }
+    return {};
+}
+
+// 중첩 JSON 객체 내부 추출 ("key":{ ... })
+// 반환값: { 이후 내용 (닫는 괄호 포함 안 함)
+[[nodiscard]] inline std::string_view json_get_obj(std::string_view json,
+                                                    std::string_view key) {
+    auto k = std::format(R"("{}":{{)", key);
+    auto pos = json.find(k);
+    if (pos == std::string_view::npos) return json;  // fallback
+    return json.substr(pos + k.size());
 }
 
 inline std::string env_or(const char* name, std::string_view def = "") {
@@ -646,7 +638,7 @@ struct GoogleProvider {
             "https://oauth2.googleapis.com/token", body);
         if (!token_resp.ok()) co_return std::nullopt;
 
-        const auto access_token = detail::json_get_str(token_resp.body, "access_token");
+        const auto access_token = detail::json_get_field(token_resp.body, "access_token");
         if (access_token.empty()) co_return std::nullopt;
 
         // 2. 사용자 정보 조회
@@ -658,10 +650,10 @@ struct GoogleProvider {
         const auto& j = info_resp.body;
         co_return UserInfo{
             .provider    = "google",
-            .provider_id = detail::json_get_str(j, "sub"),
-            .email       = detail::json_get_str(j, "email"),
-            .name        = detail::json_get_str(j, "name"),
-            .avatar_url  = detail::json_get_str(j, "picture"),
+            .provider_id = detail::json_get_field(j, "sub"),
+            .email       = detail::json_get_field(j, "email"),
+            .name        = detail::json_get_field(j, "name"),
+            .avatar_url  = detail::json_get_field(j, "picture"),
         };
     }
 };
@@ -697,31 +689,30 @@ struct NaverProvider {
             "https://nid.naver.com/oauth2.0/token", body);
         if (!token_resp.ok()) co_return std::nullopt;
 
-        const auto access_token = detail::json_get_str(token_resp.body, "access_token");
+        const auto access_token = detail::json_get_field(token_resp.body, "access_token");
         if (access_token.empty()) co_return std::nullopt;
 
-        // 2. 사용자 정보 (Authorization Bearer)
-        // Naver userinfo는 GET + Authorization 헤더 필요 → https::get 확장 필요.
-        // 여기서는 HTTPS GET을 직접 구성합니다.
-        const std::string userinfo_url =
-            "https://openapi.naver.com/v1/nid/me";
+        // 2. 사용자 정보 — Authorization: Bearer 헤더로 전달 (URL 파라미터 노출 방지)
+        const std::string auth_header =
+            std::format("Authorization: Bearer {}\r\n", access_token);
         auto info_raw = co_await https::get(
-            userinfo_url + "?access_token=" + qbuem::url_encode(access_token));
+            "https://openapi.naver.com/v1/nid/me", auth_header);
+        if (!info_raw.ok()) co_return std::nullopt;
 
         // Naver 응답: {"resultcode":"00","message":"success","response":{...}}
         const auto& j = info_raw.body;
-        // response 객체 내부 추출
-        auto resp_start = j.find(R"("response":{)");
-        std::string resp_json;
-        if (resp_start != std::string::npos) {
-            resp_json = j.substr(resp_start + 12);
-        }
+        constexpr std::string_view kRespKey = R"("response":{)";
+        auto resp_start = j.find(kRespKey);
+        std::string_view resp_json = (resp_start != std::string::npos)
+            ? std::string_view{j}.substr(resp_start + kRespKey.size())
+            : std::string_view{j};
+
         co_return UserInfo{
             .provider    = "naver",
-            .provider_id = detail::json_get_str(resp_json.empty() ? j : resp_json, "id"),
-            .email       = detail::json_get_str(resp_json.empty() ? j : resp_json, "email"),
-            .name        = detail::json_get_str(resp_json.empty() ? j : resp_json, "name"),
-            .avatar_url  = detail::json_get_str(resp_json.empty() ? j : resp_json, "profile_image"),
+            .provider_id = detail::json_get_field(resp_json, "id"),
+            .email       = detail::json_get_field(resp_json, "email"),
+            .name        = detail::json_get_field(resp_json, "name"),
+            .avatar_url  = detail::json_get_field(resp_json, "profile_image"),
         };
     }
 };
@@ -755,7 +746,7 @@ struct KakaoProvider {
             "https://kauth.kakao.com/oauth/token", body);
         if (!token_resp.ok()) co_return std::nullopt;
 
-        const auto access_token = detail::json_get_str(token_resp.body, "access_token");
+        const auto access_token = detail::json_get_field(token_resp.body, "access_token");
         if (access_token.empty()) co_return std::nullopt;
 
         // 2. 사용자 정보
@@ -767,48 +758,60 @@ struct KakaoProvider {
         // 카카오 응답 구조:
         // {"id":1234,"kakao_account":{"email":"..","profile":{"nickname":"..","profile_image_url":".."}}}
         const auto& j = info_resp.body;
-        const auto id = detail::json_get_str(j, "id");
 
-        auto acc_start = j.find(R"("kakao_account":{)");
-        std::string acc_json = (acc_start != std::string::npos)
-            ? j.substr(acc_start + 17) : j;
+        // "id"는 정수 필드
+        const auto id = detail::json_get_field(j, "id");
 
-        auto prof_start = acc_json.find(R"("profile":{)");
-        std::string prof_json = (prof_start != std::string::npos)
-            ? acc_json.substr(prof_start + 11) : acc_json;
+        // 중첩 객체 접근: kakao_account → profile
+        auto acc_json  = detail::json_get_obj(j, "kakao_account");
+        auto prof_json = detail::json_get_obj(acc_json, "profile");
 
         co_return UserInfo{
             .provider    = "kakao",
             .provider_id = id,
-            .email       = detail::json_get_str(acc_json, "email"),
-            .name        = detail::json_get_str(prof_json, "nickname"),
-            .avatar_url  = detail::json_get_str(prof_json, "profile_image_url"),
+            .email       = detail::json_get_field(acc_json, "email"),
+            .name        = detail::json_get_field(prof_json, "nickname"),
+            .avatar_url  = detail::json_get_field(prof_json, "profile_image_url"),
         };
     }
 };
 
-// ── CSRF state 관리 (인메모리, TTL 10분) ─────────────────────────────────────
+// ── CSRF state 관리 (인메모리, TTL 10분, 스레드 안전) ────────────────────────
 
 namespace state_store {
 
-struct Entry { std::string value; int64_t exp; };
+struct Entry { int64_t exp; };
 inline std::unordered_map<std::string, Entry> g_states;
+inline std::mutex g_mutex;
+
+// 만료된 엔트리 정리 (내부용, mutex 보유 상태에서 호출)
+inline void purge_expired_locked(int64_t now) {
+    for (auto it = g_states.begin(); it != g_states.end(); ) {
+        if (it->second.exp < now) it = g_states.erase(it);
+        else ++it;
+    }
+}
 
 inline std::string issue() {
     using namespace std::chrono;
+    const int64_t now = duration_cast<seconds>(
+        system_clock::now().time_since_epoch()).count();
     auto state = qbuem::crypto::csrf_token(128);
-    int64_t exp = duration_cast<seconds>(
-        system_clock::now().time_since_epoch()).count() + 600;
-    g_states[state] = {state, exp};
+
+    std::lock_guard lock{g_mutex};
+    purge_expired_locked(now);
+    g_states[state] = {now + 600};
     return state;
 }
 
 inline bool verify_and_consume(std::string_view state) {
     using namespace std::chrono;
+    const int64_t now = duration_cast<seconds>(
+        system_clock::now().time_since_epoch()).count();
+
+    std::lock_guard lock{g_mutex};
     auto it = g_states.find(std::string{state});
     if (it == g_states.end()) return false;
-    int64_t now = duration_cast<seconds>(
-        system_clock::now().time_since_epoch()).count();
     bool valid = (it->second.exp >= now);
     g_states.erase(it);
     return valid;
@@ -819,67 +822,45 @@ inline bool verify_and_consume(std::string_view state) {
 } // namespace qbuem_routine::oauth
 ```
 
----
+## CMakeLists.txt
 
-## 아키텍처 메모
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(qbuem-auth VERSION 1.0.0 LANGUAGES CXX)
 
-### JWT 토큰 구조
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
+include(FetchContent)
+
+# ── qbuem-stack ───────────────────────────────────────────────────────────────
+set(QBUEM_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+set(QBUEM_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(QBUEM_BUILD_BENCH    OFF CACHE BOOL "" FORCE)
+set(QBUEM_INSTALL        OFF CACHE BOOL "" FORCE)
+
+FetchContent_Declare(
+    qbuem_stack
+    GIT_REPOSITORY https://github.com/qbuem/qbuem-stack.git
+    GIT_TAG        main
+)
+FetchContent_MakeAvailable(qbuem_stack)
+
+# ── OpenSSL (OAuth HTTPS + TLS) ───────────────────────────────────────────────
+find_package(OpenSSL REQUIRED)
+
+# ── qbuem-auth (header-only) ──────────────────────────────────────────────────
+# jwt.hpp        — HS256 JWT (qbuem::crypto only, no OpenSSL)
+# https_client.hpp — HTTPS 클라이언트 (OpenSSL BIO)
+# oauth.hpp      — Google / Naver / Kakao OAuth2
+add_library(qbuem_auth INTERFACE)
+target_include_directories(qbuem_auth INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(qbuem_auth INTERFACE
+    qbuem-stack::crypto
+    qbuem-stack::http
+    OpenSSL::SSL
+    OpenSSL::Crypto
+)
+add_library(qbuem-auth::auth ALIAS qbuem_auth)
 ```
-base64url({"alg":"HS256","typ":"JWT"})
-. base64url({"sub":"<id>","provider":"...","email":"...","name":"...","iat":<ts>,"exp":<ts>})
-. base64url(HMAC-SHA256(header.payload, JWT_SECRET))
-```
-
-- 비밀 키: 환경변수 JWT_SECRET (≤32 bytes) 또는 CSPRNG 자동 생성 (프로세스당 1회)
-- 서명 검증: `qbuem::crypto::constant_time_equal()` — 타이밍 오라클 방지
-- Base64url: RFC 4648 §5, 패딩(=) 없음
-
-### HTTPS 클라이언트 비동기 흐름
-
-```
-co_await https::post(url, body)
-  │
-  ├─ ::eventfd(0, EFD_NONBLOCK|EFD_CLOEXEC)  →  efd
-  ├─ std::thread([=]() {
-  │      Response r = detail::do_https_blocking(host, port, "POST", path, body, ct);
-  │      ::write(efd, &one, 8);   // 완료 신호
-  │  }).detach();
-  └─ co_await EventFdAwaiter{efd}
-          └─ Reactor::register_event(efd, Read, [h]{ h.resume(); })
-```
-
-### OAuth2 흐름 (Google 예시)
-
-```
-Client                      qbuem-routine             Google
-  │  GET /auth/google/login       │                      │
-  │──────────────────────────────>│                      │
-  │  302 → accounts.google.com    │                      │
-  │<──────────────────────────────│                      │
-  │                               │  (user logs in)      │
-  │  GET /auth/google/callback    │                      │
-  │  ?code=XXX&state=YYY          │                      │
-  │──────────────────────────────>│                      │
-  │                               │  POST /token         │
-  │                               │─────────────────────>│
-  │                               │  {access_token}      │
-  │                               │<─────────────────────│
-  │                               │  GET /userinfo       │
-  │                               │─────────────────────>│
-  │                               │  {sub,email,name}    │
-  │                               │<─────────────────────│
-  │  200 {jwt_token}              │                      │
-  │<──────────────────────────────│                      │
-```
-
-### CSRF State 관리
-
-```cpp
-// state_store (in-memory, TTL 600s)
-std::unordered_map<std::string, Entry> g_states;  // {value, exp_unix_sec}
-
-state_store::issue()                  // csrf_token(128) 발급 + 저장
-state_store::verify_and_consume(s)    // 검증 + erase (1회용)
-```
-

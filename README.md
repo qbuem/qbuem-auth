@@ -88,7 +88,7 @@ std::optional<std::string_view> t = jwt::extract_bearer(auth_header);
 ```
 
 - 서명 검증: `qbuem::crypto::constant_time_equal()` (타이밍 오라클 방지)
-- Payload JSON 직렬화: `std::format` (qbuem-json 불필요)
+- Payload JSON 직렬화: `std::format` (외부 JSON 라이브러리 불필요)
 - Base64url: 패딩 없음 (`false`)
 
 ---
@@ -118,6 +118,7 @@ co_await https::post(url, body)
 - `SSL_VERIFY_PEER` — 인증서 검증 활성화
 - SNI 지원 (`SSL_set_tlsext_host_name`)
 - HTTP/1.1, `Connection: close`
+- `ssl_init()` — `std::call_once` 로 스레드 안전 초기화
 
 ### Response 구조체
 
@@ -138,8 +139,16 @@ struct Response {
 auto resp = co_await https::post(url, body);
 auto resp = co_await https::post(url, body, "application/json");
 
+// POST + 추가 헤더
+auto resp = co_await https::post(url, body,
+    "application/x-www-form-urlencoded",
+    "Authorization: Bearer token\r\n");
+
 // GET
 auto resp = co_await https::get(url);
+
+// GET + 추가 헤더 (예: Naver API)
+auto resp = co_await https::get(url, "Authorization: Bearer token\r\n");
 
 if (resp.ok()) { /* resp.body ... */ }
 ```
@@ -147,6 +156,15 @@ if (resp.ok()) { /* resp.body ... */ }
 ### URL 파싱
 
 `https://host[:port]/path?query` 형식 자동 파싱. 포트 기본값 443 (http: 80).
+
+### 추가 헤더 형식
+
+`extra_headers` 파라미터는 각 헤더를 `\r\n` 으로 끝내는 문자열을 이어 붙인 형태입니다.
+
+```cpp
+"Authorization: Bearer abc123\r\n"
+"X-Custom-Header: value\r\n"
+```
 
 ---
 
@@ -198,16 +216,9 @@ std::string state = state_store::issue();
 bool ok = state_store::verify_and_consume(state);
 ```
 
-`qbuem::crypto::csrf_token(128)` — 128-bit CSPRNG URL-safe base64url 토큰 생성.
-
-### 환경변수
-
-```
-GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
-NAVER_CLIENT_ID,  NAVER_CLIENT_SECRET
-KAKAO_CLIENT_ID,  KAKAO_CLIENT_SECRET
-OAUTH_REDIRECT_BASE   (예: https://your-domain.com, 기본값: http://localhost:8080)
-```
+- `qbuem::crypto::csrf_token(128)` — 128-bit CSPRNG URL-safe base64url 토큰 생성
+- `std::mutex` 로 스레드 안전 보장
+- `issue()` 호출 시 만료된 엔트리 자동 정리
 
 ### 프로바이더 API
 
@@ -220,9 +231,28 @@ std::string url = NaverProvider::authorize_url(state);
 std::string url = KakaoProvider::authorize_url(state);
 
 // 코드 교환 → UserInfo
-auto info = co_await GoogleProvider::exchange(code);   // optional<UserInfo>
-auto info = co_await NaverProvider::exchange(code, state);
+auto info = co_await GoogleProvider::exchange(code);          // optional<UserInfo>
+auto info = co_await NaverProvider::exchange(code, state);    // state 파라미터 필요
 auto info = co_await KakaoProvider::exchange(code);
+```
+
+### Naver 특이사항
+
+Naver 사용자 정보 API는 액세스 토큰을 **URL 파라미터가 아닌 `Authorization: Bearer` 헤더**로 전달합니다.
+라이브러리 내부에서 `https::get(url, "Authorization: Bearer <token>\r\n")` 형태로 처리되므로 별도 설정 불필요합니다.
+
+### Kakao 특이사항
+
+Kakao 응답의 `id` 필드는 JSON 정수(`"id":1234`)로 반환됩니다.
+`json_get_field()` 헬퍼가 문자열·정수 형식 모두 지원하므로 자동 처리됩니다.
+
+### 환경변수
+
+```
+GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
+NAVER_CLIENT_ID,  NAVER_CLIENT_SECRET
+KAKAO_CLIENT_ID,  KAKAO_CLIENT_SECRET
+OAUTH_REDIRECT_BASE   (예: https://your-domain.com, 기본값: http://localhost:8080)
 ```
 
 ---
@@ -238,3 +268,12 @@ cmake --build build
 ```
 
 **요구사항**: GCC ≥ 13 / Clang ≥ 17, CMake ≥ 3.20, libssl-dev (OpenSSL)
+
+---
+
+## LLM 컨텍스트 파일
+
+| 파일 | 설명 |
+|------|------|
+| `llms.txt` | 핵심 API 요약 (간략) |
+| `llms_full.txt` | 전체 소스 코드 (상세) |

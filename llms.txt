@@ -32,11 +32,15 @@ std::optional<std::string_view> t = jwt::extract_bearer(auth_header);
 
 OpenSSL BIO 블로킹 I/O를 별도 std::thread에서 실행.
 eventfd를 Reactor에 등록하여 완료 시 코루틴 재개 (Reactor 스레드 비블로킹).
+ssl_init()은 std::call_once로 스레드 안전 초기화.
 
 ```cpp
 auto resp = co_await https::post(url, body);           // POST
+auto resp = co_await https::post(url, body, content_type, extra_headers);
 auto resp = co_await https::get(url);                  // GET
+auto resp = co_await https::get(url, extra_headers);   // GET + 커스텀 헤더
 // Response: { int status; std::string body; bool ok(); }
+// extra_headers 형식: "Header-Name: value\r\n" 형태의 문자열
 ```
 
 EventFdAwaiter: await_suspend()에서 Reactor::register_event(efd, Read, resume_handler)
@@ -48,11 +52,15 @@ UserInfo: { provider, provider_id, email, name, avatar_url }
 
 프로바이더별 authorize_url() + exchange() 정적 메서드:
 - GoogleProvider: OIDC, scope=openid+email+profile
-- NaverProvider:  exchange(code, state) 시그니처
-- KakaoProvider:  kakao_account.profile 중첩 JSON 파싱
+- NaverProvider:  exchange(code, state) 시그니처, Authorization: Bearer 헤더 사용
+- KakaoProvider:  kakao_account.profile 중첩 JSON 파싱, id 필드는 정수형
+
+JSON 파싱: json_get_field()가 문자열("key":"val")과 정수("key":123) 모두 처리.
+중첩 객체: json_get_obj()로 "key":{ 내부 추출 (매직 넘버 없음).
 
 CSRF state: qbuem::crypto::csrf_token(128), TTL 10분, in-memory unordered_map
-  state_store::issue() / state_store::verify_and_consume(state)
+  state_store::issue() — std::mutex 보호, 만료 엔트리 자동 정리
+  state_store::verify_and_consume(state) — 1회용, 스레드 안전
 
 환경변수: {GOOGLE,NAVER,KAKAO}_{CLIENT_ID,CLIENT_SECRET}, OAUTH_REDIRECT_BASE
 
