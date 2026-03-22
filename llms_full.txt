@@ -19,7 +19,7 @@
  *   base64url(header) . base64url(payload) . base64url(HMAC-SHA256)
  *
  * Payload:
- *   sub (string), provider, email, name, iat (int), exp (int)
+ *   sub (string), provider, email, name, iat (int), exp (int), type ("access"|"refresh")
  */
 
 #include <qbuem/crypto/base64.hpp>
@@ -43,6 +43,10 @@ namespace qbuem_routine::jwt {
 inline constexpr int64_t kAccessTokenTTL  = 60 * 60 * 24;       // 24h
 inline constexpr int64_t kRefreshTokenTTL = 60 * 60 * 24 * 30;  // 30d
 
+// ── 토큰 종류 ─────────────────────────────────────────────────────────────────
+
+enum class TokenType { Access, Refresh };
+
 // ── Claims ────────────────────────────────────────────────────────────────────
 
 struct Claims {
@@ -50,8 +54,9 @@ struct Claims {
     std::string provider;
     std::string email;
     std::string name;
-    int64_t     iat = 0;
-    int64_t     exp = 0;
+    int64_t     iat  = 0;
+    int64_t     exp  = 0;
+    TokenType   type = TokenType::Access;
 };
 
 // ── 비밀 키 (256-bit, 프로세스 시작 시 1회 생성) ──────────────────────────────
@@ -101,15 +106,19 @@ namespace detail {
 }
 
 // Payload JSON 생성
-[[nodiscard]] inline std::string make_payload(const Claims& c, int64_t now) {
+[[nodiscard]] inline std::string make_payload(const Claims& c, int64_t now,
+                                               int64_t ttl, TokenType type) {
+    const std::string_view type_str =
+        (type == TokenType::Refresh) ? "refresh" : "access";
     return std::format(
-        R"({{"sub":"{}","provider":{},"email":{},"name":{},"iat":{},"exp":{}}})",
+        R"({{"sub":"{}","provider":{},"email":{},"name":{},"iat":{},"exp":{},"type":"{}"}})",
         c.sub,
         json_str(c.provider),
         json_str(c.email),
         json_str(c.name),
         now,
-        now + kAccessTokenTTL);
+        now + ttl,
+        type_str);
 }
 
 // HMAC-SHA256 서명 → base64url
@@ -158,13 +167,28 @@ namespace detail {
 
 // ── 토큰 발급 ────────────────────────────────────────────────────────────────
 
+/// 액세스 토큰 발급 (TTL: 24h)
 [[nodiscard]] inline std::string encode(const Claims& c) {
     using namespace std::chrono;
     const int64_t now = duration_cast<seconds>(
         system_clock::now().time_since_epoch()).count();
 
     const auto b64_payload = qbuem::crypto::base64url_encode(
-        detail::make_payload(c, now), false);
+        detail::make_payload(c, now, kAccessTokenTTL, TokenType::Access), false);
+    const auto signing_input = detail::encoded_header() + "." + b64_payload;
+    const auto b64_sig       = detail::sign(signing_input);
+
+    return signing_input + "." + b64_sig;
+}
+
+/// 리프레시 토큰 발급 (TTL: 30d)
+[[nodiscard]] inline std::string encode_refresh(const Claims& c) {
+    using namespace std::chrono;
+    const int64_t now = duration_cast<seconds>(
+        system_clock::now().time_since_epoch()).count();
+
+    const auto b64_payload = qbuem::crypto::base64url_encode(
+        detail::make_payload(c, now, kRefreshTokenTTL, TokenType::Refresh), false);
     const auto signing_input = detail::encoded_header() + "." + b64_payload;
     const auto b64_sig       = detail::sign(signing_input);
 
@@ -173,7 +197,14 @@ namespace detail {
 
 // ── 토큰 검증 ────────────────────────────────────────────────────────────────
 
-[[nodiscard]] inline std::optional<Claims> decode(std::string_view token) {
+/**
+ * @brief 토큰 검증 + Claims 추출
+ * @param token       검증할 JWT 문자열
+ * @param expect_type 기대하는 토큰 종류 (기본: Access)
+ * @return 유효한 Claims, 서명 불일치·만료·종류 불일치 시 nullopt
+ */
+[[nodiscard]] inline std::optional<Claims>
+decode(std::string_view token, TokenType expect_type = TokenType::Access) {
     // 3개 세그먼트 분리
     auto p1 = token.find('.');
     if (p1 == std::string_view::npos) return std::nullopt;
@@ -204,6 +235,11 @@ namespace detail {
     claims.name     = detail::extract_str(payload, "name");
     claims.iat      = detail::extract_int(payload, "iat");
     claims.exp      = detail::extract_int(payload, "exp");
+
+    // 토큰 종류 확인
+    const auto type_str = detail::extract_str(payload, "type");
+    claims.type = (type_str == "refresh") ? TokenType::Refresh : TokenType::Access;
+    if (claims.type != expect_type) return std::nullopt;
 
     // 만료 확인
     using namespace std::chrono;
@@ -495,7 +531,7 @@ get(std::string_view url, std::string_view extra_headers = "")
  * 흐름:
  *   1. GET /auth/{provider}/login  → 302 redirect to provider
  *   2. GET /auth/{provider}/callback?code=...&state=...
- *         → 코드 교환 → 사용자 정보 조회 → JWT 발급
+ *         → state CSRF 검증 → 코드 교환 → 사용자 정보 조회 → JWT 발급
  *
  * 환경변수 설정:
  *   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
@@ -531,7 +567,7 @@ struct UserInfo {
     std::string avatar_url;
 };
 
-// ── URL 인코딩/디코딩 — qbuem::url_encode / url_decode 위임 ──────────────────
+// ── 내부 헬퍼 ────────────────────────────────────────────────────────────────
 
 namespace detail {
 
@@ -573,8 +609,7 @@ parse_query(std::string_view qs) {
     pos = json.find(k_int);
     if (pos != std::string_view::npos) {
         pos += k_int.size();
-        // 공백 건너뜀
-        while (pos < json.size() && json[pos] == ' ') ++pos;
+        while (pos < json.size() && json[pos] == ' ') ++pos;  // 공백 건너뜀
         auto end = pos;
         while (end < json.size() && json[end] != ',' &&
                json[end] != '}' && json[end] != ']') {
@@ -606,6 +641,52 @@ inline std::string redirect_base() {
 
 } // namespace detail
 
+// ── CSRF state 관리 (인메모리, TTL 10분, 스레드 안전) ────────────────────────
+// 모든 프로바이더가 공유하므로 프로바이더 선언보다 먼저 위치해야 합니다.
+
+namespace state_store {
+
+struct Entry { int64_t exp; };
+inline std::unordered_map<std::string, Entry> g_states;
+inline std::mutex g_mutex;
+
+// 만료된 엔트리 정리 (내부용, mutex 보유 상태에서 호출)
+inline void purge_expired_locked(int64_t now) {
+    for (auto it = g_states.begin(); it != g_states.end(); ) {
+        if (it->second.exp < now) it = g_states.erase(it);
+        else ++it;
+    }
+}
+
+/// CSRF 토큰 발급 (TTL 10분). issue() 호출 시 만료 토큰 자동 정리.
+inline std::string issue() {
+    using namespace std::chrono;
+    const int64_t now = duration_cast<seconds>(
+        system_clock::now().time_since_epoch()).count();
+    auto state = qbuem::crypto::csrf_token(128);
+
+    std::lock_guard lock{g_mutex};
+    purge_expired_locked(now);
+    g_states[state] = {now + 600};
+    return state;
+}
+
+/// 검증 + 소비 (1회용). 유효하고 만료되지 않은 경우에만 true.
+inline bool verify_and_consume(std::string_view state) {
+    using namespace std::chrono;
+    const int64_t now = duration_cast<seconds>(
+        system_clock::now().time_since_epoch()).count();
+
+    std::lock_guard lock{g_mutex};
+    auto it = g_states.find(std::string{state});
+    if (it == g_states.end()) return false;
+    bool valid = (it->second.exp >= now);
+    g_states.erase(it);
+    return valid;
+}
+
+} // namespace state_store
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Google OAuth2 (OIDC)
 // ═════════════════════════════════════════════════════════════════════════════
@@ -623,8 +704,12 @@ struct GoogleProvider {
             state);
     }
 
+    /// @param code  콜백으로 수신한 인가 코드
+    /// @param state 콜백으로 수신한 state (CSRF 검증용)
     [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
-    exchange(std::string_view code) {
+    exchange(std::string_view code, std::string_view state) {
+        if (!state_store::verify_and_consume(state)) co_return std::nullopt;
+
         // 1. 코드 → 액세스 토큰
         const std::string body = std::format(
             "code={}&client_id={}&client_secret={}"
@@ -641,10 +726,11 @@ struct GoogleProvider {
         const auto access_token = detail::json_get_field(token_resp.body, "access_token");
         if (access_token.empty()) co_return std::nullopt;
 
-        // 2. 사용자 정보 조회
+        // 2. 사용자 정보 — Authorization: Bearer 헤더로 전달 (URL 노출 방지)
+        const std::string auth_header =
+            std::format("Authorization: Bearer {}\r\n", access_token);
         auto info_resp = co_await https::get(
-            "https://www.googleapis.com/oauth2/v3/userinfo"
-            "?access_token=" + qbuem::url_encode(access_token));
+            "https://www.googleapis.com/oauth2/v3/userinfo", auth_header);
         if (!info_resp.ok()) co_return std::nullopt;
 
         const auto& j = info_resp.body;
@@ -674,9 +760,13 @@ struct NaverProvider {
             state);
     }
 
+    /// @param code  콜백으로 수신한 인가 코드
+    /// @param state 콜백으로 수신한 state (CSRF 검증 + Naver 토큰 요청용)
     [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
     exchange(std::string_view code, std::string_view state) {
-        // 1. 코드 → 액세스 토큰
+        if (!state_store::verify_and_consume(state)) co_return std::nullopt;
+
+        // 1. 코드 → 액세스 토큰 (Naver 스펙: state를 토큰 요청에도 포함)
         const std::string body = std::format(
             "grant_type=authorization_code&client_id={}&client_secret={}"
             "&code={}&state={}",
@@ -692,7 +782,7 @@ struct NaverProvider {
         const auto access_token = detail::json_get_field(token_resp.body, "access_token");
         if (access_token.empty()) co_return std::nullopt;
 
-        // 2. 사용자 정보 — Authorization: Bearer 헤더로 전달 (URL 파라미터 노출 방지)
+        // 2. 사용자 정보 — Authorization: Bearer 헤더로 전달 (URL 노출 방지)
         const std::string auth_header =
             std::format("Authorization: Bearer {}\r\n", access_token);
         auto info_raw = co_await https::get(
@@ -733,8 +823,12 @@ struct KakaoProvider {
             state);
     }
 
+    /// @param code  콜백으로 수신한 인가 코드
+    /// @param state 콜백으로 수신한 state (CSRF 검증용)
     [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
-    exchange(std::string_view code) {
+    exchange(std::string_view code, std::string_view state) {
+        if (!state_store::verify_and_consume(state)) co_return std::nullopt;
+
         // 1. 코드 → 액세스 토큰
         const std::string body = std::format(
             "grant_type=authorization_code&client_id={}&redirect_uri={}&code={}",
@@ -749,17 +843,18 @@ struct KakaoProvider {
         const auto access_token = detail::json_get_field(token_resp.body, "access_token");
         if (access_token.empty()) co_return std::nullopt;
 
-        // 2. 사용자 정보
+        // 2. 사용자 정보 — Authorization: Bearer 헤더로 전달 (URL 노출 방지)
+        const std::string auth_header =
+            std::format("Authorization: Bearer {}\r\n", access_token);
         auto info_resp = co_await https::get(
-            "https://kapi.kakao.com/v2/user/me"
-            "?access_token=" + qbuem::url_encode(access_token));
+            "https://kapi.kakao.com/v2/user/me", auth_header);
         if (!info_resp.ok()) co_return std::nullopt;
 
         // 카카오 응답 구조:
         // {"id":1234,"kakao_account":{"email":"..","profile":{"nickname":"..","profile_image_url":".."}}}
         const auto& j = info_resp.body;
 
-        // "id"는 정수 필드
+        // "id"는 정수 필드 — json_get_field가 스칼라 형식 자동 처리
         const auto id = detail::json_get_field(j, "id");
 
         // 중첩 객체 접근: kakao_account → profile
@@ -775,49 +870,6 @@ struct KakaoProvider {
         };
     }
 };
-
-// ── CSRF state 관리 (인메모리, TTL 10분, 스레드 안전) ────────────────────────
-
-namespace state_store {
-
-struct Entry { int64_t exp; };
-inline std::unordered_map<std::string, Entry> g_states;
-inline std::mutex g_mutex;
-
-// 만료된 엔트리 정리 (내부용, mutex 보유 상태에서 호출)
-inline void purge_expired_locked(int64_t now) {
-    for (auto it = g_states.begin(); it != g_states.end(); ) {
-        if (it->second.exp < now) it = g_states.erase(it);
-        else ++it;
-    }
-}
-
-inline std::string issue() {
-    using namespace std::chrono;
-    const int64_t now = duration_cast<seconds>(
-        system_clock::now().time_since_epoch()).count();
-    auto state = qbuem::crypto::csrf_token(128);
-
-    std::lock_guard lock{g_mutex};
-    purge_expired_locked(now);
-    g_states[state] = {now + 600};
-    return state;
-}
-
-inline bool verify_and_consume(std::string_view state) {
-    using namespace std::chrono;
-    const int64_t now = duration_cast<seconds>(
-        system_clock::now().time_since_epoch()).count();
-
-    std::lock_guard lock{g_mutex};
-    auto it = g_states.find(std::string{state});
-    if (it == g_states.end()) return false;
-    bool valid = (it->second.exp >= now);
-    g_states.erase(it);
-    return valid;
-}
-
-} // namespace state_store
 
 } // namespace qbuem_routine::oauth
 ```

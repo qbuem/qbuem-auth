@@ -50,6 +50,7 @@ struct Claims {
     std::string name;
     int64_t     iat;        // 발급 시각 (Unix 초)
     int64_t     exp;        // 만료 시각 (Unix 초)
+    TokenType   type;       // TokenType::Access | TokenType::Refresh
 };
 ```
 
@@ -68,15 +69,31 @@ struct Claims {
 
 ```cpp
 #include "auth/jwt.hpp"
+using namespace qbuem_routine;
 
-// 토큰 발급
-std::string token = jwt::encode(claims);
+// 액세스 토큰 발급 (TTL: 24h)
+std::string access_token = jwt::encode(claims);
 
-// 토큰 검증 + Claims 추출 (만료/서명 오류 시 nullopt)
+// 리프레시 토큰 발급 (TTL: 30d)
+std::string refresh_token = jwt::encode_refresh(claims);
+
+// 액세스 토큰 검증 + Claims 추출 (만료/서명/종류 불일치 시 nullopt)
 std::optional<jwt::Claims> c = jwt::decode(token);
+
+// 리프레시 토큰 검증
+std::optional<jwt::Claims> c = jwt::decode(token, jwt::TokenType::Refresh);
 
 // Authorization 헤더에서 Bearer 토큰 추출
 std::optional<std::string_view> t = jwt::extract_bearer(auth_header);
+```
+
+### 토큰 갱신 흐름 예시
+
+```cpp
+// 리프레시 토큰으로 새 액세스 토큰 발급
+auto rc = jwt::decode(refresh_token, jwt::TokenType::Refresh);
+if (!rc) { /* 만료 또는 위조 → 재로그인 요청 */ }
+std::string new_access = jwt::encode(*rc);
 ```
 
 ### 내부 구현
@@ -88,7 +105,7 @@ std::optional<std::string_view> t = jwt::extract_bearer(auth_header);
 ```
 
 - 서명 검증: `qbuem::crypto::constant_time_equal()` (타이밍 오라클 방지)
-- Payload JSON 직렬화: `std::format` (외부 JSON 라이브러리 불필요)
+- Payload에 `"type":"access"|"refresh"` 필드 포함 → `decode()` 시 종류 검증
 - Base64url: 패딩 없음 (`false`)
 
 ---
@@ -134,6 +151,7 @@ struct Response {
 
 ```cpp
 #include "auth/https_client.hpp"
+using namespace qbuem_routine;
 
 // POST (기본 Content-Type: application/x-www-form-urlencoded)
 auto resp = co_await https::post(url, body);
@@ -147,7 +165,7 @@ auto resp = co_await https::post(url, body,
 // GET
 auto resp = co_await https::get(url);
 
-// GET + 추가 헤더 (예: Naver API)
+// GET + 추가 헤더
 auto resp = co_await https::get(url, "Authorization: Bearer token\r\n");
 
 if (resp.ok()) { /* resp.body ... */ }
@@ -176,14 +194,16 @@ Google, Naver(한국), Kakao(한국) OAuth2 프로바이더 통합.
 
 ```
 1. GET /auth/{provider}/login
+   └─ state = state_store::issue()
    └─ Provider::authorize_url(state)  →  302 redirect to provider
 
 2. GET /auth/{provider}/callback?code=...&state=...
-   ├─ state_store::verify_and_consume(state)  →  CSRF 검증
-   ├─ Provider::exchange(code)
+   ├─ Provider::exchange(code, state)
+   │    ├─ state_store::verify_and_consume(state)  →  CSRF 검증 (실패 시 nullopt)
    │    ├─ co_await https::post(token_endpoint, body)  →  access_token
-   │    └─ co_await https::get(userinfo_endpoint)       →  UserInfo
-   └─  jwt::encode(Claims{...})  →  JWT 반환
+   │    └─ co_await https::get(userinfo_endpoint, "Authorization: Bearer ...")  →  UserInfo
+   └─  jwt::encode(Claims{...})  →  액세스 토큰
+       jwt::encode_refresh(Claims{...})  →  리프레시 토큰
 ```
 
 ### UserInfo 구조체
@@ -212,39 +232,44 @@ struct UserInfo {
 // 발급 (TTL 10분, in-memory)
 std::string state = state_store::issue();
 
-// 검증 + 소비 (1회용)
+// 검증 + 소비 (1회용) — exchange() 내부에서 자동 호출됨
 bool ok = state_store::verify_and_consume(state);
 ```
 
 - `qbuem::crypto::csrf_token(128)` — 128-bit CSPRNG URL-safe base64url 토큰 생성
 - `std::mutex` 로 스레드 안전 보장
 - `issue()` 호출 시 만료된 엔트리 자동 정리
+- `verify_and_consume()` — 검증과 동시에 삭제 (재사용 불가)
 
 ### 프로바이더 API
 
+모든 `exchange()` 함수는 `state` 파라미터를 받아 **내부에서 CSRF 검증**을 수행합니다.
+
 ```cpp
 #include "auth/oauth.hpp"
+using namespace qbuem_routine;
 
 // 인가 URL 생성
-std::string url = GoogleProvider::authorize_url(state);
-std::string url = NaverProvider::authorize_url(state);
-std::string url = KakaoProvider::authorize_url(state);
+auto state = oauth::state_store::issue();
+std::string url = oauth::GoogleProvider::authorize_url(state);
+std::string url = oauth::NaverProvider::authorize_url(state);
+std::string url = oauth::KakaoProvider::authorize_url(state);
 
-// 코드 교환 → UserInfo
-auto info = co_await GoogleProvider::exchange(code);          // optional<UserInfo>
-auto info = co_await NaverProvider::exchange(code, state);    // state 파라미터 필요
-auto info = co_await KakaoProvider::exchange(code);
+// 코드 교환 → UserInfo (state CSRF 검증 포함)
+auto info = co_await oauth::GoogleProvider::exchange(code, state);  // optional<UserInfo>
+auto info = co_await oauth::NaverProvider::exchange(code, state);
+auto info = co_await oauth::KakaoProvider::exchange(code, state);
 ```
 
-### Naver 특이사항
+### 각 프로바이더 특이사항
 
-Naver 사용자 정보 API는 액세스 토큰을 **URL 파라미터가 아닌 `Authorization: Bearer` 헤더**로 전달합니다.
-라이브러리 내부에서 `https::get(url, "Authorization: Bearer <token>\r\n")` 형태로 처리되므로 별도 설정 불필요합니다.
+| 프로바이더 | 특이사항 |
+|-----------|---------|
+| **Google** | OIDC(openid+email+profile), userinfo Authorization 헤더 사용 |
+| **Naver** | state를 토큰 요청에도 포함 (Naver 스펙), userinfo Authorization 헤더 사용 |
+| **Kakao** | `id` 필드가 정수형(`"id":1234`), `kakao_account.profile` 중첩 구조 |
 
-### Kakao 특이사항
-
-Kakao 응답의 `id` 필드는 JSON 정수(`"id":1234`)로 반환됩니다.
-`json_get_field()` 헬퍼가 문자열·정수 형식 모두 지원하므로 자동 처리됩니다.
+모든 프로바이더의 사용자 정보 API 액세스 토큰은 **URL 파라미터가 아닌 `Authorization: Bearer` 헤더**로 전달됩니다.
 
 ### 환경변수
 
