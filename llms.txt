@@ -1,0 +1,65 @@
+# qbuem-auth
+
+qbuem-stack 기반 C++23 인증 라이브러리.
+HS256 JWT + OpenSSL HTTPS 클라이언트(비동기 래퍼) + Google/Naver/Kakao OAuth2.
+
+## 파일 구조
+
+- src/auth/jwt.hpp          — HS256 JWT (qbuem::crypto only, OpenSSL 불필요)
+- src/auth/https_client.hpp — HTTPS 클라이언트 (OpenSSL BIO + eventfd Reactor 통합)
+- src/auth/oauth.hpp        — Google / Naver / Kakao OAuth2 프로바이더
+- CMakeLists.txt            — qbuem-stack FetchContent + OpenSSL find_package
+
+## CMake 타겟
+
+- qbuem-auth::auth — INTERFACE 라이브러리 (헤더 전용)
+
+## JWT 핵심 API
+
+```cpp
+// Claims: sub(int64), provider, email, name, iat, exp
+std::string token = jwt::encode(claims);               // 토큰 발급
+std::optional<jwt::Claims> c = jwt::decode(token);     // 검증 + 추출
+std::optional<std::string_view> t = jwt::extract_bearer(auth_header);
+```
+
+구현: base64url(header).base64url(payload).base64url(HMAC-SHA256(h.p, secret))
+- 비밀 키: 환경변수 JWT_SECRET 또는 CSPRNG 32-byte 자동 생성
+- 서명 검증: qbuem::crypto::constant_time_equal() (타이밍 안전)
+- TTL: AccessToken=24h, RefreshToken=30d
+
+## HTTPS 클라이언트 핵심 구조
+
+OpenSSL BIO 블로킹 I/O를 별도 std::thread에서 실행.
+eventfd를 Reactor에 등록하여 완료 시 코루틴 재개 (Reactor 스레드 비블로킹).
+
+```cpp
+auto resp = co_await https::post(url, body);           // POST
+auto resp = co_await https::get(url);                  // GET
+// Response: { int status; std::string body; bool ok(); }
+```
+
+EventFdAwaiter: await_suspend()에서 Reactor::register_event(efd, Read, resume_handler)
+TLS: SSL_VERIFY_PEER + 시스템 CA + SNI + HTTP/1.1 Connection:close
+
+## OAuth2 핵심 구조
+
+UserInfo: { provider, provider_id, email, name, avatar_url }
+
+프로바이더별 authorize_url() + exchange() 정적 메서드:
+- GoogleProvider: OIDC, scope=openid+email+profile
+- NaverProvider:  exchange(code, state) 시그니처
+- KakaoProvider:  kakao_account.profile 중첩 JSON 파싱
+
+CSRF state: qbuem::crypto::csrf_token(128), TTL 10분, in-memory unordered_map
+  state_store::issue() / state_store::verify_and_consume(state)
+
+환경변수: {GOOGLE,NAVER,KAKAO}_{CLIENT_ID,CLIENT_SECRET}, OAUTH_REDIRECT_BASE
+
+## 의존성
+
+- qbuem-stack: qbuem::crypto (HMAC-SHA256, Base64url, CSPRNG, constant_time_equal)
+               qbuem::url_encode / url_decode
+               qbuem::Reactor (eventfd 통합)
+               qbuem::Task<T> (코루틴)
+- OpenSSL: SSL/TLS (HTTPS 아웃바운드 전용)
