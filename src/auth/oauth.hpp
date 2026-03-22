@@ -91,7 +91,9 @@ parse_query(std::string_view qs) {
                json[end] != '}' && json[end] != ']') {
             ++end;
         }
-        return std::string{json.substr(pos, end - pos)};
+        auto val = json.substr(pos, end - pos);
+        if (val == "null") return {};  // JSON null → 빈 문자열
+        return std::string{val};
     }
     return {};
 }
@@ -343,6 +345,288 @@ struct KakaoProvider {
             .email       = detail::json_get_field(acc_json, "email"),
             .name        = detail::json_get_field(prof_json, "nickname"),
             .avatar_url  = detail::json_get_field(prof_json, "profile_image_url"),
+        };
+    }
+};
+
+// ═════════════════════════════════════════════════════════════════════════════
+// GitHub OAuth2
+// ═════════════════════════════════════════════════════════════════════════════
+
+struct GitHubProvider {
+    static constexpr std::string_view kName = "github";
+
+    [[nodiscard]] static std::string authorize_url(std::string_view state) {
+        return std::format(
+            "https://github.com/login/oauth/authorize"
+            "?client_id={}&redirect_uri={}&scope=read:user+user:email&state={}",
+            detail::env_or("GITHUB_CLIENT_ID"),
+            qbuem::url_encode(detail::redirect_base() + "/auth/github/callback"),
+            state);
+    }
+
+    /// @param code  콜백으로 수신한 인가 코드
+    /// @param state 콜백으로 수신한 state (CSRF 검증용)
+    [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
+    exchange(std::string_view code, std::string_view state) {
+        if (!state_store::verify_and_consume(state)) co_return std::nullopt;
+
+        // 1. 코드 → 액세스 토큰
+        // GitHub은 Accept: application/json 없으면 form 인코딩으로 반환
+        const std::string body = std::format(
+            "client_id={}&client_secret={}&code={}&redirect_uri={}",
+            qbuem::url_encode(detail::env_or("GITHUB_CLIENT_ID")),
+            qbuem::url_encode(detail::env_or("GITHUB_CLIENT_SECRET")),
+            qbuem::url_encode(code),
+            qbuem::url_encode(detail::redirect_base() + "/auth/github/callback"));
+
+        auto token_resp = co_await https::post(
+            "https://github.com/login/oauth/access_token", body,
+            "application/x-www-form-urlencoded",
+            "Accept: application/json\r\n");
+        if (!token_resp.ok()) co_return std::nullopt;
+
+        const auto access_token = detail::json_get_field(token_resp.body, "access_token");
+        if (access_token.empty()) co_return std::nullopt;
+
+        // 2. 사용자 정보
+        // GitHub API는 User-Agent 헤더 필수, Authorization Bearer 사용
+        const std::string auth_header = std::format(
+            "Authorization: Bearer {}\r\n"
+            "Accept: application/vnd.github+json\r\n"
+            "X-GitHub-Api-Version: 2022-11-28\r\n"
+            "User-Agent: qbuem-auth\r\n",
+            access_token);
+
+        auto info_resp = co_await https::get("https://api.github.com/user", auth_header);
+        if (!info_resp.ok()) co_return std::nullopt;
+
+        const auto& j = info_resp.body;
+        auto email = detail::json_get_field(j, "email");
+
+        // email이 비어 있으면 (null 또는 비공개) /user/emails에서 primary 이메일 조회
+        if (email.empty()) {
+            auto emails_resp = co_await https::get(
+                "https://api.github.com/user/emails", auth_header);
+            if (emails_resp.ok()) {
+                // 배열 항목 중 "primary":true 인 객체의 email 추출
+                const auto& ea = emails_resp.body;
+                auto primary_pos = ea.find(R"("primary":true)");
+                if (primary_pos != std::string::npos) {
+                    auto obj_start = ea.rfind('{', primary_pos);
+                    if (obj_start != std::string::npos)
+                        email = detail::json_get_field(
+                            std::string_view{ea}.substr(obj_start), "email");
+                }
+            }
+        }
+
+        co_return UserInfo{
+            .provider    = "github",
+            .provider_id = detail::json_get_field(j, "id"),
+            .email       = email,
+            .name        = detail::json_get_field(j, "name"),
+            .avatar_url  = detail::json_get_field(j, "avatar_url"),
+        };
+    }
+};
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Discord OAuth2
+// ═════════════════════════════════════════════════════════════════════════════
+
+struct DiscordProvider {
+    static constexpr std::string_view kName = "discord";
+
+    [[nodiscard]] static std::string authorize_url(std::string_view state) {
+        return std::format(
+            "https://discord.com/api/oauth2/authorize"
+            "?client_id={}&redirect_uri={}&response_type=code"
+            "&scope=identify+email&state={}",
+            detail::env_or("DISCORD_CLIENT_ID"),
+            qbuem::url_encode(detail::redirect_base() + "/auth/discord/callback"),
+            state);
+    }
+
+    /// @param code  콜백으로 수신한 인가 코드
+    /// @param state 콜백으로 수신한 state (CSRF 검증용)
+    [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
+    exchange(std::string_view code, std::string_view state) {
+        if (!state_store::verify_and_consume(state)) co_return std::nullopt;
+
+        // 1. 코드 → 액세스 토큰
+        const std::string body = std::format(
+            "client_id={}&client_secret={}&grant_type=authorization_code"
+            "&code={}&redirect_uri={}",
+            qbuem::url_encode(detail::env_or("DISCORD_CLIENT_ID")),
+            qbuem::url_encode(detail::env_or("DISCORD_CLIENT_SECRET")),
+            qbuem::url_encode(code),
+            qbuem::url_encode(detail::redirect_base() + "/auth/discord/callback"));
+
+        auto token_resp = co_await https::post(
+            "https://discord.com/api/oauth2/token", body);
+        if (!token_resp.ok()) co_return std::nullopt;
+
+        const auto access_token = detail::json_get_field(token_resp.body, "access_token");
+        if (access_token.empty()) co_return std::nullopt;
+
+        // 2. 사용자 정보
+        const std::string auth_header =
+            std::format("Authorization: Bearer {}\r\n", access_token);
+        auto info_resp = co_await https::get(
+            "https://discord.com/api/users/@me", auth_header);
+        if (!info_resp.ok()) co_return std::nullopt;
+
+        const auto& j = info_resp.body;
+        const auto id     = detail::json_get_field(j, "id");
+        const auto avatar = detail::json_get_field(j, "avatar");
+
+        // 아바타 URL 조합: id + avatar 해시 → CDN URL
+        std::string avatar_url;
+        if (!avatar.empty())
+            avatar_url = std::format(
+                "https://cdn.discordapp.com/avatars/{}/{}.png", id, avatar);
+
+        // 표시 이름: global_name 우선, 없으면 username
+        auto name = detail::json_get_field(j, "global_name");
+        if (name.empty())
+            name = detail::json_get_field(j, "username");
+
+        co_return UserInfo{
+            .provider    = "discord",
+            .provider_id = id,
+            .email       = detail::json_get_field(j, "email"),
+            .name        = name,
+            .avatar_url  = avatar_url,
+        };
+    }
+};
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Microsoft OAuth2 (Azure AD / Entra ID)
+// ═════════════════════════════════════════════════════════════════════════════
+
+struct MicrosoftProvider {
+    static constexpr std::string_view kName = "microsoft";
+
+    [[nodiscard]] static std::string authorize_url(std::string_view state) {
+        const auto tenant = detail::env_or("MICROSOFT_TENANT_ID", "common");
+        return std::format(
+            "https://login.microsoftonline.com/{}/oauth2/v2.0/authorize"
+            "?client_id={}&redirect_uri={}&response_type=code"
+            "&scope=openid+email+profile+User.Read&state={}",
+            tenant,
+            detail::env_or("MICROSOFT_CLIENT_ID"),
+            qbuem::url_encode(detail::redirect_base() + "/auth/microsoft/callback"),
+            state);
+    }
+
+    /// @param code  콜백으로 수신한 인가 코드
+    /// @param state 콜백으로 수신한 state (CSRF 검증용)
+    [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
+    exchange(std::string_view code, std::string_view state) {
+        if (!state_store::verify_and_consume(state)) co_return std::nullopt;
+
+        // 1. 코드 → 액세스 토큰 (테넌트별 엔드포인트)
+        const auto tenant = detail::env_or("MICROSOFT_TENANT_ID", "common");
+        const std::string body = std::format(
+            "client_id={}&client_secret={}&grant_type=authorization_code"
+            "&code={}&redirect_uri={}",
+            qbuem::url_encode(detail::env_or("MICROSOFT_CLIENT_ID")),
+            qbuem::url_encode(detail::env_or("MICROSOFT_CLIENT_SECRET")),
+            qbuem::url_encode(code),
+            qbuem::url_encode(detail::redirect_base() + "/auth/microsoft/callback"));
+
+        const auto token_url = std::format(
+            "https://login.microsoftonline.com/{}/oauth2/v2.0/token", tenant);
+        auto token_resp = co_await https::post(token_url, body);
+        if (!token_resp.ok()) co_return std::nullopt;
+
+        const auto access_token = detail::json_get_field(token_resp.body, "access_token");
+        if (access_token.empty()) co_return std::nullopt;
+
+        // 2. 사용자 정보 (Microsoft Graph API)
+        const std::string auth_header =
+            std::format("Authorization: Bearer {}\r\n", access_token);
+        auto info_resp = co_await https::get(
+            "https://graph.microsoft.com/v1.0/me", auth_header);
+        if (!info_resp.ok()) co_return std::nullopt;
+
+        const auto& j = info_resp.body;
+
+        // 이메일: mail (Exchange) 또는 userPrincipalName (개인 계정) 순서로 시도
+        auto email = detail::json_get_field(j, "mail");
+        if (email.empty())
+            email = detail::json_get_field(j, "userPrincipalName");
+
+        co_return UserInfo{
+            .provider    = "microsoft",
+            .provider_id = detail::json_get_field(j, "id"),
+            .email       = email,
+            .name        = detail::json_get_field(j, "displayName"),
+            .avatar_url  = {},  // Graph API 프로필 사진은 별도 /me/photo/$value 엔드포인트
+        };
+    }
+};
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Facebook OAuth2 (Meta)
+// ═════════════════════════════════════════════════════════════════════════════
+
+struct FacebookProvider {
+    static constexpr std::string_view kName = "facebook";
+
+    [[nodiscard]] static std::string authorize_url(std::string_view state) {
+        return std::format(
+            "https://www.facebook.com/v20.0/dialog/oauth"
+            "?client_id={}&redirect_uri={}&scope=email,public_profile&state={}",
+            detail::env_or("FACEBOOK_CLIENT_ID"),
+            qbuem::url_encode(detail::redirect_base() + "/auth/facebook/callback"),
+            state);
+    }
+
+    /// @param code  콜백으로 수신한 인가 코드
+    /// @param state 콜백으로 수신한 state (CSRF 검증용)
+    [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
+    exchange(std::string_view code, std::string_view state) {
+        if (!state_store::verify_and_consume(state)) co_return std::nullopt;
+
+        // 1. 코드 → 액세스 토큰 (Facebook은 GET 방식 사용)
+        const auto token_url = std::format(
+            "https://graph.facebook.com/v20.0/oauth/access_token"
+            "?client_id={}&client_secret={}&code={}&redirect_uri={}",
+            qbuem::url_encode(detail::env_or("FACEBOOK_CLIENT_ID")),
+            qbuem::url_encode(detail::env_or("FACEBOOK_CLIENT_SECRET")),
+            qbuem::url_encode(code),
+            qbuem::url_encode(detail::redirect_base() + "/auth/facebook/callback"));
+
+        auto token_resp = co_await https::get(token_url);
+        if (!token_resp.ok()) co_return std::nullopt;
+
+        const auto access_token = detail::json_get_field(token_resp.body, "access_token");
+        if (access_token.empty()) co_return std::nullopt;
+
+        // 2. 사용자 정보 (필요 필드 명시, picture 포함)
+        const std::string auth_header =
+            std::format("Authorization: Bearer {}\r\n", access_token);
+        auto info_resp = co_await https::get(
+            "https://graph.facebook.com/v20.0/me"
+            "?fields=id,name,email,picture.type(large)",
+            auth_header);
+        if (!info_resp.ok()) co_return std::nullopt;
+
+        // 프로필 사진 중첩 구조: {"picture":{"data":{"url":"..."}}}
+        const auto& j = info_resp.body;
+        auto pic_data    = detail::json_get_obj(j, "picture");
+        auto pic_inner   = detail::json_get_obj(pic_data, "data");
+        auto avatar_url  = detail::json_get_field(pic_inner, "url");
+
+        co_return UserInfo{
+            .provider    = "facebook",
+            .provider_id = detail::json_get_field(j, "id"),
+            .email       = detail::json_get_field(j, "email"),
+            .name        = detail::json_get_field(j, "name"),
+            .avatar_url  = avatar_url,
         };
     }
 };

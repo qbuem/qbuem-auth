@@ -225,6 +225,10 @@ struct UserInfo {
 | Google | accounts.google.com/o/oauth2/v2/auth | oauth2.googleapis.com/token | googleapis.com/oauth2/v3/userinfo |
 | Naver | nid.naver.com/oauth2.0/authorize | nid.naver.com/oauth2.0/token | openapi.naver.com/v1/nid/me |
 | Kakao | kauth.kakao.com/oauth/authorize | kauth.kakao.com/oauth/token | kapi.kakao.com/v2/user/me |
+| GitHub | github.com/login/oauth/authorize | github.com/login/oauth/access_token | api.github.com/user |
+| Discord | discord.com/api/oauth2/authorize | discord.com/api/oauth2/token | discord.com/api/users/@me |
+| Microsoft | login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize | login.microsoftonline.com/{tenant}/oauth2/v2.0/token | graph.microsoft.com/v1.0/me |
+| Facebook | facebook.com/v20.0/dialog/oauth | graph.facebook.com/v20.0/oauth/access_token | graph.facebook.com/v20.0/me |
 
 ### CSRF State 관리
 
@@ -254,11 +258,19 @@ auto state = oauth::state_store::issue();
 std::string url = oauth::GoogleProvider::authorize_url(state);
 std::string url = oauth::NaverProvider::authorize_url(state);
 std::string url = oauth::KakaoProvider::authorize_url(state);
+std::string url = oauth::GitHubProvider::authorize_url(state);
+std::string url = oauth::DiscordProvider::authorize_url(state);
+std::string url = oauth::MicrosoftProvider::authorize_url(state);
+std::string url = oauth::FacebookProvider::authorize_url(state);
 
 // 코드 교환 → UserInfo (state CSRF 검증 포함)
-auto info = co_await oauth::GoogleProvider::exchange(code, state);  // optional<UserInfo>
+auto info = co_await oauth::GoogleProvider::exchange(code, state);    // optional<UserInfo>
 auto info = co_await oauth::NaverProvider::exchange(code, state);
 auto info = co_await oauth::KakaoProvider::exchange(code, state);
+auto info = co_await oauth::GitHubProvider::exchange(code, state);
+auto info = co_await oauth::DiscordProvider::exchange(code, state);
+auto info = co_await oauth::MicrosoftProvider::exchange(code, state);
+auto info = co_await oauth::FacebookProvider::exchange(code, state);
 ```
 
 ### 각 프로바이더 특이사항
@@ -266,18 +278,27 @@ auto info = co_await oauth::KakaoProvider::exchange(code, state);
 | 프로바이더 | 특이사항 |
 |-----------|---------|
 | **Google** | OIDC(openid+email+profile), userinfo Authorization 헤더 사용 |
-| **Naver** | state를 토큰 요청에도 포함 (Naver 스펙), userinfo Authorization 헤더 사용 |
+| **Naver** | state를 토큰 요청에도 포함 (Naver 스펙) |
 | **Kakao** | `id` 필드가 정수형(`"id":1234`), `kakao_account.profile` 중첩 구조 |
+| **GitHub** | `User-Agent` 헤더 필수, `Accept: application/json` 토큰 요청 필수, 이메일 비공개 시 `/user/emails`에서 primary 이메일 자동 조회 |
+| **Discord** | 아바타 URL을 `id`+`avatar_hash`로 조합, `global_name` 없으면 `username` 사용 |
+| **Microsoft** | 테넌트 `MICROSOFT_TENANT_ID` (기본: `common`), 이메일은 `mail` → `userPrincipalName` 순 |
+| **Facebook** | 토큰 교환이 GET 방식(비표준), picture는 `picture.data.url` 중첩 구조 |
 
-모든 프로바이더의 사용자 정보 API 액세스 토큰은 **URL 파라미터가 아닌 `Authorization: Bearer` 헤더**로 전달됩니다.
+모든 프로바이더의 사용자 정보 API 액세스 토큰은 **URL 파라미터가 아닌 `Authorization: Bearer` 헤더**로 전달됩니다. (Facebook 토큰 교환 단계는 예외)
 
 ### 환경변수
 
 ```
-GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
-NAVER_CLIENT_ID,  NAVER_CLIENT_SECRET
-KAKAO_CLIENT_ID,  KAKAO_CLIENT_SECRET
-OAUTH_REDIRECT_BASE   (예: https://your-domain.com, 기본값: http://localhost:8080)
+GOOGLE_CLIENT_ID,    GOOGLE_CLIENT_SECRET
+NAVER_CLIENT_ID,     NAVER_CLIENT_SECRET
+KAKAO_CLIENT_ID,     KAKAO_CLIENT_SECRET
+GITHUB_CLIENT_ID,    GITHUB_CLIENT_SECRET
+DISCORD_CLIENT_ID,   DISCORD_CLIENT_SECRET
+MICROSOFT_CLIENT_ID, MICROSOFT_CLIENT_SECRET
+MICROSOFT_TENANT_ID  (기본값: common — 멀티테넌트)
+FACEBOOK_CLIENT_ID,  FACEBOOK_CLIENT_SECRET
+OAUTH_REDIRECT_BASE  (예: https://your-domain.com, 기본값: http://localhost:8080)
 ```
 
 ---
