@@ -17,9 +17,11 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
+#include <charconv>
 #include <cstring>
 #include <format>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -37,17 +39,17 @@ struct Response {
     bool        ok() const noexcept { return status >= 200 && status < 300; }
 };
 
-// ── OpenSSL 전역 초기화 (한 번만) ────────────────────────────────────────────
+// ── OpenSSL 전역 초기화 (한 번만, 스레드 안전) ───────────────────────────────
 
 namespace detail {
 
 inline void ssl_init() {
-    static bool done = false;
-    if (done) return;
-    done = true;
-    SSL_library_init();
-    SSL_load_error_strings();
-    OpenSSL_add_all_algorithms();
+    static std::once_flag flag;
+    std::call_once(flag, []() {
+        SSL_library_init();
+        SSL_load_error_strings();
+        OpenSSL_add_all_algorithms();
+    });
 }
 
 // ── 블로킹 HTTPS 요청 (별도 스레드에서 실행) ─────────────────────────────────
@@ -58,23 +60,37 @@ inline void ssl_init() {
     std::string_view method,
     std::string_view path,
     std::string_view body,
-    std::string_view content_type)
+    std::string_view content_type,
+    std::string_view extra_headers = "")
 {
     ssl_init();
 
     SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx) return {0, "SSL_CTX_new failed"};
-    // 인증서 검증 (시스템 CA 사용)
     SSL_CTX_set_default_verify_paths(ctx);
     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
 
     const std::string addr = std::format("{}:{}", host, port);
+
     BIO* bio = BIO_new_ssl_connect(ctx);
+    if (!bio) {
+        SSL_CTX_free(ctx);
+        return {0, "BIO_new_ssl_connect failed"};
+    }
+
     SSL* ssl = nullptr;
     BIO_get_ssl(bio, &ssl);
+    if (!ssl) {
+        BIO_free_all(bio);
+        SSL_CTX_free(ctx);
+        return {0, "BIO_get_ssl failed"};
+    }
+
     SSL_set_mode(ssl, SSL_MODE_AUTO_RETRY);
-    // SNI
-    SSL_set_tlsext_host_name(ssl, std::string(host).c_str());
+
+    // SNI: 임시 객체가 아닌 named string으로 전달 (포인터 유효성 보장)
+    const std::string host_str{host};
+    SSL_set_tlsext_host_name(ssl, host_str.c_str());
     BIO_set_conn_hostname(bio, addr.c_str());
 
     if (BIO_do_connect(bio) <= 0 || BIO_do_handshake(bio) <= 0) {
@@ -86,13 +102,21 @@ inline void ssl_init() {
     // HTTP 요청 조합
     std::string req = std::format(
         "{} {} HTTP/1.1\r\n"
-        "Host: {}\r\n"
-        "Content-Type: {}\r\n"
-        "Content-Length: {}\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "{}",
-        method, path, host, content_type, body.size(), body);
+        "Host: {}\r\n",
+        method, path, host);
+
+    // Content-Type / Content-Length는 바디가 있을 때만 전송
+    // (GET 등 바디 없는 요청에 Content-Length: 0을 보내면 일부 서버가 거부)
+    if (!body.empty()) {
+        if (!content_type.empty())
+            req += std::format("Content-Type: {}\r\n", content_type);
+        req += std::format("Content-Length: {}\r\n", body.size());
+    }
+
+    if (!extra_headers.empty())
+        req += extra_headers;
+
+    req += std::format("Connection: close\r\n\r\n{}", body);
 
     BIO_write(bio, req.data(), static_cast<int>(req.size()));
     BIO_flush(bio);
@@ -126,6 +150,32 @@ inline void ssl_init() {
     return {status, std::move(resp_body)};
 }
 
+// URL 파싱 (host, port, path) 공통 헬퍼
+struct ParsedUrl {
+    std::string host;
+    uint16_t    port;
+    std::string path;
+};
+
+[[nodiscard]] inline ParsedUrl parse_url(std::string_view url) {
+    uint16_t port = 443;
+    if (url.starts_with("https://")) url.remove_prefix(8);
+    else if (url.starts_with("http://")) { url.remove_prefix(7); port = 80; }
+
+    auto slash = url.find('/');
+    std::string host{url.substr(0, slash)};
+    std::string path = (slash != std::string_view::npos) ? std::string{url.substr(slash)} : "/";
+
+    // 포트 오버라이드
+    if (auto colon = host.rfind(':'); colon != std::string::npos) {
+        std::from_chars(host.data() + colon + 1,
+                        host.data() + host.size(), port);
+        host.erase(colon);
+    }
+
+    return {std::move(host), port, std::move(path)};
+}
+
 } // namespace detail
 
 // ── eventfd Awaiter ───────────────────────────────────────────────────────────
@@ -154,47 +204,36 @@ struct EventFdAwaiter {
 
 /**
  * @brief URL 파싱 후 비동기 HTTPS POST 요청
- * @param url         전체 URL (https://host/path?query)
- * @param body        요청 바디
+ * @param url          전체 URL (https://host/path?query)
+ * @param body         요청 바디
  * @param content_type Content-Type 헤더 값
+ * @param extra_headers 추가 헤더 문자열 (각 줄 \r\n 으로 끝나야 함)
  */
 [[nodiscard]] inline qbuem::Task<Response>
 post(std::string_view url, std::string_view body,
-     std::string_view content_type = "application/x-www-form-urlencoded")
+     std::string_view content_type  = "application/x-www-form-urlencoded",
+     std::string_view extra_headers = "")
 {
-    // URL 파싱 (host, port, path)
-    std::string_view u = url;
-    uint16_t port = 443;
-    if (u.starts_with("https://")) u.remove_prefix(8);
-    else if (u.starts_with("http://")) { u.remove_prefix(7); port = 80; }
+    auto [host, port, path] = detail::parse_url(url);
 
-    auto slash = u.find('/');
-    std::string host{u.substr(0, slash)};
-    std::string path = (slash != std::string_view::npos) ? std::string{u.substr(slash)} : "/";
-
-    // 포트 오버라이드
-    if (auto colon = host.rfind(':'); colon != std::string::npos) {
-        std::from_chars(host.data() + colon + 1,
-                        host.data() + host.size(), port);
-        host.erase(colon);
-    }
-
-    // eventfd 생성
     int efd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (efd < 0) co_return Response{0, "eventfd creation failed"};
 
     auto result = std::make_shared<Response>();
     std::string host_copy{host}, path_copy{path};
     std::string body_copy{body}, ct_copy{content_type};
+    std::string hdrs_copy{extra_headers};
 
-    // 블로킹 작업을 별도 스레드에서 실행
-    std::thread([=, result]() mutable {
+    // [=] 로 캡처: result(shared_ptr), efd, 문자열들 모두 값 복사
+    // [=, result] 는 C++ 표준상 중복 캡처 오류이므로 [=] 사용
+    std::thread([=]() mutable {
         *result = detail::do_https_blocking(host_copy, port, "POST",
-                                            path_copy, body_copy, ct_copy);
+                                            path_copy, body_copy, ct_copy, hdrs_copy);
         uint64_t one = 1;
         ::write(efd, &one, sizeof(one));
+        // efd는 write 완료 후 코루틴이 close()하므로 여기서 닫지 않음
     }).detach();
 
-    // reactor 이벤트로 완료 대기
     co_await EventFdAwaiter{efd};
     ::close(efd);
     co_return *result;
@@ -202,31 +241,22 @@ post(std::string_view url, std::string_view body,
 
 /**
  * @brief 비동기 HTTPS GET 요청
+ * @param url          전체 URL (https://host/path?query)
+ * @param extra_headers 추가 헤더 문자열 (각 줄 \r\n 으로 끝나야 함)
  */
 [[nodiscard]] inline qbuem::Task<Response>
-get(std::string_view url)
+get(std::string_view url, std::string_view extra_headers = "")
 {
-    std::string_view u = url;
-    uint16_t port = 443;
-    if (u.starts_with("https://")) u.remove_prefix(8);
-    else if (u.starts_with("http://")) { u.remove_prefix(7); port = 80; }
-
-    auto slash = u.find('/');
-    std::string host{u.substr(0, slash)};
-    std::string path = (slash != std::string_view::npos) ? std::string{u.substr(slash)} : "/";
-
-    if (auto colon = host.rfind(':'); colon != std::string::npos) {
-        std::from_chars(host.data() + colon + 1,
-                        host.data() + host.size(), port);
-        host.erase(colon);
-    }
+    auto [host, port, path] = detail::parse_url(url);
 
     int efd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    auto result = std::make_shared<Response>();
-    std::string h{host}, p{path};
+    if (efd < 0) co_return Response{0, "eventfd creation failed"};
 
-    std::thread([=, result]() mutable {
-        *result = detail::do_https_blocking(h, port, "GET", p, "", "");
+    auto result = std::make_shared<Response>();
+    std::string h{host}, p{path}, hdrs{extra_headers};
+
+    std::thread([=]() mutable {
+        *result = detail::do_https_blocking(h, port, "GET", p, "", "", hdrs);
         uint64_t one = 1;
         ::write(efd, &one, sizeof(one));
     }).detach();

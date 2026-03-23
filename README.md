@@ -50,6 +50,7 @@ struct Claims {
     std::string name;
     int64_t     iat;        // 발급 시각 (Unix 초)
     int64_t     exp;        // 만료 시각 (Unix 초)
+    TokenType   type;       // TokenType::Access | TokenType::Refresh
 };
 ```
 
@@ -68,15 +69,31 @@ struct Claims {
 
 ```cpp
 #include "auth/jwt.hpp"
+using namespace qbuem_routine;
 
-// 토큰 발급
-std::string token = jwt::encode(claims);
+// 액세스 토큰 발급 (TTL: 24h)
+std::string access_token = jwt::encode(claims);
 
-// 토큰 검증 + Claims 추출 (만료/서명 오류 시 nullopt)
+// 리프레시 토큰 발급 (TTL: 30d)
+std::string refresh_token = jwt::encode_refresh(claims);
+
+// 액세스 토큰 검증 + Claims 추출 (만료/서명/종류 불일치 시 nullopt)
 std::optional<jwt::Claims> c = jwt::decode(token);
+
+// 리프레시 토큰 검증
+std::optional<jwt::Claims> c = jwt::decode(token, jwt::TokenType::Refresh);
 
 // Authorization 헤더에서 Bearer 토큰 추출
 std::optional<std::string_view> t = jwt::extract_bearer(auth_header);
+```
+
+### 토큰 갱신 흐름 예시
+
+```cpp
+// 리프레시 토큰으로 새 액세스 토큰 발급
+auto rc = jwt::decode(refresh_token, jwt::TokenType::Refresh);
+if (!rc) { /* 만료 또는 위조 → 재로그인 요청 */ }
+std::string new_access = jwt::encode(*rc);
 ```
 
 ### 내부 구현
@@ -88,7 +105,7 @@ std::optional<std::string_view> t = jwt::extract_bearer(auth_header);
 ```
 
 - 서명 검증: `qbuem::crypto::constant_time_equal()` (타이밍 오라클 방지)
-- Payload JSON 직렬화: `std::format` (qbuem-json 불필요)
+- Payload에 `"type":"access"|"refresh"` 필드 포함 → `decode()` 시 종류 검증
 - Base64url: 패딩 없음 (`false`)
 
 ---
@@ -118,6 +135,7 @@ co_await https::post(url, body)
 - `SSL_VERIFY_PEER` — 인증서 검증 활성화
 - SNI 지원 (`SSL_set_tlsext_host_name`)
 - HTTP/1.1, `Connection: close`
+- `ssl_init()` — `std::call_once` 로 스레드 안전 초기화
 
 ### Response 구조체
 
@@ -133,13 +151,22 @@ struct Response {
 
 ```cpp
 #include "auth/https_client.hpp"
+using namespace qbuem_routine;
 
 // POST (기본 Content-Type: application/x-www-form-urlencoded)
 auto resp = co_await https::post(url, body);
 auto resp = co_await https::post(url, body, "application/json");
 
+// POST + 추가 헤더
+auto resp = co_await https::post(url, body,
+    "application/x-www-form-urlencoded",
+    "Authorization: Bearer token\r\n");
+
 // GET
 auto resp = co_await https::get(url);
+
+// GET + 추가 헤더
+auto resp = co_await https::get(url, "Authorization: Bearer token\r\n");
 
 if (resp.ok()) { /* resp.body ... */ }
 ```
@@ -147,6 +174,15 @@ if (resp.ok()) { /* resp.body ... */ }
 ### URL 파싱
 
 `https://host[:port]/path?query` 형식 자동 파싱. 포트 기본값 443 (http: 80).
+
+### 추가 헤더 형식
+
+`extra_headers` 파라미터는 각 헤더를 `\r\n` 으로 끝내는 문자열을 이어 붙인 형태입니다.
+
+```cpp
+"Authorization: Bearer abc123\r\n"
+"X-Custom-Header: value\r\n"
+```
 
 ---
 
@@ -158,14 +194,16 @@ Google, Naver(한국), Kakao(한국) OAuth2 프로바이더 통합.
 
 ```
 1. GET /auth/{provider}/login
+   └─ state = state_store::issue()
    └─ Provider::authorize_url(state)  →  302 redirect to provider
 
 2. GET /auth/{provider}/callback?code=...&state=...
-   ├─ state_store::verify_and_consume(state)  →  CSRF 검증
-   ├─ Provider::exchange(code)
+   ├─ Provider::exchange(code, state)
+   │    ├─ state_store::verify_and_consume(state)  →  CSRF 검증 (실패 시 nullopt)
    │    ├─ co_await https::post(token_endpoint, body)  →  access_token
-   │    └─ co_await https::get(userinfo_endpoint)       →  UserInfo
-   └─  jwt::encode(Claims{...})  →  JWT 반환
+   │    └─ co_await https::get(userinfo_endpoint, "Authorization: Bearer ...")  →  UserInfo
+   └─  jwt::encode(Claims{...})  →  액세스 토큰
+       jwt::encode_refresh(Claims{...})  →  리프레시 토큰
 ```
 
 ### UserInfo 구조체
@@ -187,6 +225,10 @@ struct UserInfo {
 | Google | accounts.google.com/o/oauth2/v2/auth | oauth2.googleapis.com/token | googleapis.com/oauth2/v3/userinfo |
 | Naver | nid.naver.com/oauth2.0/authorize | nid.naver.com/oauth2.0/token | openapi.naver.com/v1/nid/me |
 | Kakao | kauth.kakao.com/oauth/authorize | kauth.kakao.com/oauth/token | kapi.kakao.com/v2/user/me |
+| GitHub | github.com/login/oauth/authorize | github.com/login/oauth/access_token | api.github.com/user |
+| Discord | discord.com/api/oauth2/authorize | discord.com/api/oauth2/token | discord.com/api/users/@me |
+| Microsoft | login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize | login.microsoftonline.com/{tenant}/oauth2/v2.0/token | graph.microsoft.com/v1.0/me |
+| Facebook | facebook.com/v20.0/dialog/oauth | graph.facebook.com/v20.0/oauth/access_token | graph.facebook.com/v20.0/me |
 
 ### CSRF State 관리
 
@@ -194,35 +236,69 @@ struct UserInfo {
 // 발급 (TTL 10분, in-memory)
 std::string state = state_store::issue();
 
-// 검증 + 소비 (1회용)
+// 검증 + 소비 (1회용) — exchange() 내부에서 자동 호출됨
 bool ok = state_store::verify_and_consume(state);
 ```
 
-`qbuem::crypto::csrf_token(128)` — 128-bit CSPRNG URL-safe base64url 토큰 생성.
+- `qbuem::crypto::csrf_token(128)` — 128-bit CSPRNG URL-safe base64url 토큰 생성
+- `std::mutex` 로 스레드 안전 보장
+- `issue()` 호출 시 만료된 엔트리 자동 정리
+- `verify_and_consume()` — 검증과 동시에 삭제 (재사용 불가)
+
+### 프로바이더 API
+
+모든 `exchange()` 함수는 `state` 파라미터를 받아 **내부에서 CSRF 검증**을 수행합니다.
+
+```cpp
+#include "auth/oauth.hpp"
+using namespace qbuem_routine;
+
+// 인가 URL 생성
+auto state = oauth::state_store::issue();
+std::string url = oauth::GoogleProvider::authorize_url(state);
+std::string url = oauth::NaverProvider::authorize_url(state);
+std::string url = oauth::KakaoProvider::authorize_url(state);
+std::string url = oauth::GitHubProvider::authorize_url(state);
+std::string url = oauth::DiscordProvider::authorize_url(state);
+std::string url = oauth::MicrosoftProvider::authorize_url(state);
+std::string url = oauth::FacebookProvider::authorize_url(state);
+
+// 코드 교환 → UserInfo (state CSRF 검증 포함)
+auto info = co_await oauth::GoogleProvider::exchange(code, state);    // optional<UserInfo>
+auto info = co_await oauth::NaverProvider::exchange(code, state);
+auto info = co_await oauth::KakaoProvider::exchange(code, state);
+auto info = co_await oauth::GitHubProvider::exchange(code, state);
+auto info = co_await oauth::DiscordProvider::exchange(code, state);
+auto info = co_await oauth::MicrosoftProvider::exchange(code, state);
+auto info = co_await oauth::FacebookProvider::exchange(code, state);
+```
+
+### 각 프로바이더 특이사항
+
+| 프로바이더 | 특이사항 |
+|-----------|---------|
+| **Google** | OIDC(openid+email+profile), userinfo Authorization 헤더 사용 |
+| **Naver** | state를 토큰 요청에도 포함 (Naver 스펙) |
+| **Kakao** | `id` 필드가 정수형(`"id":1234`), `kakao_account.profile` 중첩 구조 |
+| **GitHub** | `User-Agent` 헤더 필수, `Accept: application/json` 토큰 요청 필수, 이메일 비공개 시 `/user/emails`에서 primary 이메일 자동 조회 |
+| **Discord** | 아바타 URL을 `id`+`avatar_hash`로 조합, `global_name` 없으면 `username` 사용 |
+| **Microsoft** | 테넌트 `MICROSOFT_TENANT_ID` (기본: `common`), 이메일은 `mail` → `userPrincipalName` 순 |
+| **Facebook** | 토큰 교환이 GET 방식(비표준), picture는 `picture.data.url` 중첩 구조 |
+
+모든 프로바이더의 사용자 정보 API 액세스 토큰은 **URL 파라미터가 아닌 `Authorization: Bearer` 헤더**로 전달됩니다. (Facebook 토큰 교환 단계는 예외)
 
 ### 환경변수
 
 ```
-GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
-NAVER_CLIENT_ID,  NAVER_CLIENT_SECRET
-KAKAO_CLIENT_ID,  KAKAO_CLIENT_SECRET
-OAUTH_REDIRECT_BASE   (예: https://your-domain.com, 기본값: http://localhost:8080)
-```
-
-### 프로바이더 API
-
-```cpp
-#include "auth/oauth.hpp"
-
-// 인가 URL 생성
-std::string url = GoogleProvider::authorize_url(state);
-std::string url = NaverProvider::authorize_url(state);
-std::string url = KakaoProvider::authorize_url(state);
-
-// 코드 교환 → UserInfo
-auto info = co_await GoogleProvider::exchange(code);   // optional<UserInfo>
-auto info = co_await NaverProvider::exchange(code, state);
-auto info = co_await KakaoProvider::exchange(code);
+GOOGLE_CLIENT_ID,    GOOGLE_CLIENT_SECRET
+NAVER_CLIENT_ID,     NAVER_CLIENT_SECRET
+KAKAO_CLIENT_ID,     KAKAO_CLIENT_SECRET
+GITHUB_CLIENT_ID,    GITHUB_CLIENT_SECRET
+DISCORD_CLIENT_ID,   DISCORD_CLIENT_SECRET
+MICROSOFT_CLIENT_ID, MICROSOFT_CLIENT_SECRET
+MICROSOFT_TENANT_ID  (기본값: common — 멀티테넌트)
+FACEBOOK_CLIENT_ID,  FACEBOOK_CLIENT_SECRET
+OAUTH_REDIRECT_BASE  (예: https://your-domain.com, 기본값: http://localhost:8080)
 ```
 
 ---
@@ -238,3 +314,12 @@ cmake --build build
 ```
 
 **요구사항**: GCC ≥ 13 / Clang ≥ 17, CMake ≥ 3.20, libssl-dev (OpenSSL)
+
+---
+
+## LLM 컨텍스트 파일
+
+| 파일 | 설명 |
+|------|------|
+| `llms.txt` | 핵심 API 요약 (간략) |
+| `llms_full.txt` | 전체 소스 코드 (상세) |

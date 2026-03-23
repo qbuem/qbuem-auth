@@ -17,26 +17,36 @@ HS256 JWT + OpenSSL HTTPS 클라이언트(비동기 래퍼) + Google/Naver/Kakao
 ## JWT 핵심 API
 
 ```cpp
-// Claims: sub(int64), provider, email, name, iat, exp
-std::string token = jwt::encode(claims);               // 토큰 발급
-std::optional<jwt::Claims> c = jwt::decode(token);     // 검증 + 추출
+// Claims: sub(int64), provider, email, name, iat, exp, type(TokenType)
+// TokenType: TokenType::Access | TokenType::Refresh
+
+std::string access_token  = jwt::encode(claims);          // 액세스 토큰 (24h)
+std::string refresh_token = jwt::encode_refresh(claims);  // 리프레시 토큰 (30d)
+
+std::optional<jwt::Claims> c = jwt::decode(token);                           // 액세스 검증
+std::optional<jwt::Claims> c = jwt::decode(token, jwt::TokenType::Refresh);  // 리프레시 검증
 std::optional<std::string_view> t = jwt::extract_bearer(auth_header);
 ```
 
 구현: base64url(header).base64url(payload).base64url(HMAC-SHA256(h.p, secret))
 - 비밀 키: 환경변수 JWT_SECRET 또는 CSPRNG 32-byte 자동 생성
 - 서명 검증: qbuem::crypto::constant_time_equal() (타이밍 안전)
+- Payload에 "type":"access"|"refresh" 포함 → decode() 시 종류 불일치 차단
 - TTL: AccessToken=24h, RefreshToken=30d
 
 ## HTTPS 클라이언트 핵심 구조
 
 OpenSSL BIO 블로킹 I/O를 별도 std::thread에서 실행.
 eventfd를 Reactor에 등록하여 완료 시 코루틴 재개 (Reactor 스레드 비블로킹).
+ssl_init()은 std::call_once로 스레드 안전 초기화.
 
 ```cpp
-auto resp = co_await https::post(url, body);           // POST
-auto resp = co_await https::get(url);                  // GET
+auto resp = co_await https::post(url, body);                          // POST
+auto resp = co_await https::post(url, body, content_type, extra_headers);
+auto resp = co_await https::get(url);                                 // GET
+auto resp = co_await https::get(url, extra_headers);                  // GET + 커스텀 헤더
 // Response: { int status; std::string body; bool ok(); }
+// extra_headers: "Header-Name: value\r\n" 형태 문자열
 ```
 
 EventFdAwaiter: await_suspend()에서 Reactor::register_event(efd, Read, resume_handler)
@@ -46,15 +56,30 @@ TLS: SSL_VERIFY_PEER + 시스템 CA + SNI + HTTP/1.1 Connection:close
 
 UserInfo: { provider, provider_id, email, name, avatar_url }
 
-프로바이더별 authorize_url() + exchange() 정적 메서드:
-- GoogleProvider: OIDC, scope=openid+email+profile
-- NaverProvider:  exchange(code, state) 시그니처
-- KakaoProvider:  kakao_account.profile 중첩 JSON 파싱
+state_store (CSRF, 프로바이더보다 먼저 선언됨):
+  state_store::issue() — std::mutex 보호, 만료 엔트리 자동 정리, TTL 10분
+  state_store::verify_and_consume(state) — 1회용, 스레드 안전
 
-CSRF state: qbuem::crypto::csrf_token(128), TTL 10분, in-memory unordered_map
-  state_store::issue() / state_store::verify_and_consume(state)
+모든 프로바이더 exchange()는 state 파라미터로 CSRF 검증을 수행:
+  Provider::exchange(code, state) — nullopt if CSRF 실패
 
-환경변수: {GOOGLE,NAVER,KAKAO}_{CLIENT_ID,CLIENT_SECRET}, OAUTH_REDIRECT_BASE
+프로바이더별 특이사항:
+- GoogleProvider:   OIDC scope=openid+email+profile, userinfo Authorization Bearer
+- NaverProvider:    state를 토큰 요청에도 포함 (Naver 스펙)
+- KakaoProvider:    id 정수형, kakao_account.profile 중첩
+- GitHubProvider:   User-Agent 필수, Accept:application/json 토큰 요청 필수,
+                    이메일 비공개 시 /user/emails API에서 primary 이메일 자동 조회
+- DiscordProvider:  avatar URL 조합(id+hash), global_name → username 폴백
+- MicrosoftProvider: 테넌트별 URL(MICROSOFT_TENANT_ID, 기본 common),
+                     이메일 mail → userPrincipalName 순
+- FacebookProvider:  토큰 교환 GET 방식(비표준), picture.data.url 중첩
+
+JSON 파싱: json_get_field()가 문자열/정수/null 모두 처리 (null → "").
+중첩 객체: json_get_obj()로 "key":{ 내부 추출.
+모든 userinfo 액세스 토큰은 Authorization Bearer 헤더로 전달 (Facebook 토큰 교환 단계 제외).
+
+환경변수: {GOOGLE,NAVER,KAKAO,GITHUB,DISCORD,MICROSOFT,FACEBOOK}_{CLIENT_ID,CLIENT_SECRET}
+          MICROSOFT_TENANT_ID (기본 common), OAUTH_REDIRECT_BASE
 
 ## 의존성
 
