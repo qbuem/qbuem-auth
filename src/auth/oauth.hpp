@@ -204,7 +204,7 @@ struct GoogleProvider {
             "&scope=openid+email+profile&state={}",
             qbuem::url_encode(detail::env_or("GOOGLE_CLIENT_ID")),
             qbuem::url_encode(detail::redirect_base() + "/auth/google/callback"),
-            state);
+            qbuem::url_encode(state));
     }
 
     [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
@@ -258,7 +258,7 @@ struct NaverProvider {
             "?client_id={}&redirect_uri={}&response_type=code&state={}",
             qbuem::url_encode(detail::env_or("NAVER_CLIENT_ID")),
             qbuem::url_encode(detail::redirect_base() + "/auth/naver/callback"),
-            state);
+            qbuem::url_encode(state));
     }
 
     [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
@@ -316,7 +316,7 @@ struct KakaoProvider {
             "?client_id={}&redirect_uri={}&response_type=code&state={}",
             qbuem::url_encode(detail::env_or("KAKAO_CLIENT_ID")),
             qbuem::url_encode(detail::redirect_base() + "/auth/kakao/callback"),
-            state);
+            qbuem::url_encode(state));
     }
 
     [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
@@ -352,8 +352,9 @@ struct KakaoProvider {
         const auto id = detail::json_get_field(j, "id");
 
         // 중첩 객체 접근: kakao_account → profile
-        // json_get_obj 는 key 없으면 빈 뷰를 반환하므로 안전
+        // kakao_account 누락은 비정상 응답 — nullopt 반환
         auto acc_json  = detail::json_get_obj(j, "kakao_account");
+        if (acc_json.empty()) co_return std::nullopt;
         auto prof_json = detail::json_get_obj(acc_json, "profile");
 
         co_return UserInfo{
@@ -379,7 +380,7 @@ struct GitHubProvider {
             "?client_id={}&redirect_uri={}&scope=read:user+user:email&state={}",
             qbuem::url_encode(detail::env_or("GITHUB_CLIENT_ID")),
             qbuem::url_encode(detail::redirect_base() + "/auth/github/callback"),
-            state);
+            qbuem::url_encode(state));
     }
 
     [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
@@ -460,7 +461,7 @@ struct DiscordProvider {
             "&scope=identify+email&state={}",
             qbuem::url_encode(detail::env_or("DISCORD_CLIENT_ID")),
             qbuem::url_encode(detail::redirect_base() + "/auth/discord/callback"),
-            state);
+            qbuem::url_encode(state));
     }
 
     [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
@@ -531,7 +532,7 @@ struct MicrosoftProvider {
             tenant,
             qbuem::url_encode(detail::env_or("MICROSOFT_CLIENT_ID")),
             qbuem::url_encode(detail::redirect_base() + "/auth/microsoft/callback"),
-            state);
+            qbuem::url_encode(state));
     }
 
     [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
@@ -601,7 +602,7 @@ struct FacebookProvider {
             "?client_id={}&redirect_uri={}&scope=email,public_profile&state={}",
             qbuem::url_encode(detail::env_or("FACEBOOK_CLIENT_ID")),
             qbuem::url_encode(detail::redirect_base() + "/auth/facebook/callback"),
-            state);
+            qbuem::url_encode(state));
     }
 
     [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
