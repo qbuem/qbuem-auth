@@ -1,13 +1,13 @@
 # qbuem-auth
 
 qbuem-stack 기반 C++23 인증 라이브러리.
-HS256 JWT + OpenSSL HTTPS 클라이언트(비동기 래퍼) + Google/Naver/Kakao OAuth2.
+HS256 JWT + OpenSSL HTTPS 클라이언트(비동기 래퍼) + Google/GitHub/Discord/Microsoft/Facebook/Naver/Kakao OAuth2.
 
 ## 파일 구조
 
 - src/auth/jwt.hpp          — HS256 JWT (qbuem::crypto only, OpenSSL 불필요)
 - src/auth/https_client.hpp — HTTPS 클라이언트 (OpenSSL BIO + eventfd Reactor 통합)
-- src/auth/oauth.hpp        — Google / Naver / Kakao OAuth2 프로바이더
+- src/auth/oauth.hpp        — Google / GitHub / Discord / Microsoft / Facebook / Naver / Kakao OAuth2 프로바이더
 - CMakeLists.txt            — qbuem-stack FetchContent + OpenSSL find_package
 
 ## CMake 타겟

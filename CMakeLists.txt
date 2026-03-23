@@ -26,7 +26,7 @@ find_package(OpenSSL REQUIRED)
 # ── qbuem-auth (header-only) ──────────────────────────────────────────────────
 # jwt.hpp        — HS256 JWT (qbuem::crypto only, no OpenSSL)
 # https_client.hpp — HTTPS 클라이언트 (OpenSSL BIO)
-# oauth.hpp      — Google / Naver / Kakao OAuth2
+# oauth.hpp      — Google / GitHub / Discord / Microsoft / Facebook / Naver / Kakao OAuth2
 add_library(qbuem_auth INTERFACE)
 target_include_directories(qbuem_auth INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(qbuem_auth INTERFACE

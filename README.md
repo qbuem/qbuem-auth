@@ -1,7 +1,7 @@
 # qbuem-auth
 
 qbuem-stack 기반 C++23 인증 라이브러리.
-HS256 JWT, OpenSSL HTTPS 클라이언트(비동기 래퍼), Google/Naver/Kakao OAuth2 를 제공합니다.
+HS256 JWT, OpenSSL HTTPS 클라이언트(비동기 래퍼), Google/GitHub/Discord/Microsoft/Facebook/Naver/Kakao OAuth2 를 제공합니다.
 
 ## 제공 컴포넌트
 
@@ -9,7 +9,7 @@ HS256 JWT, OpenSSL HTTPS 클라이언트(비동기 래퍼), Google/Naver/Kakao O
 |------|------|
 | `src/auth/jwt.hpp` | HS256 JWT 생성·검증 (OpenSSL 불필요, qbuem::crypto 전용) |
 | `src/auth/https_client.hpp` | 경량 HTTPS 클라이언트 (OpenSSL BIO + eventfd 비동기 래퍼) |
-| `src/auth/oauth.hpp` | Google / Naver / Kakao OAuth2 프로바이더 |
+| `src/auth/oauth.hpp` | Google / GitHub / Discord / Microsoft / Facebook / Naver / Kakao OAuth2 프로바이더 |
 
 ## 빌드 의존성
 

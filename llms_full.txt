@@ -526,7 +526,8 @@ get(std::string_view url, std::string_view extra_headers = "")
 
 /**
  * @file auth/oauth.hpp
- * @brief OAuth2 프로바이더 통합 — Google / Naver / Kakao (한국 특화)
+ * @brief OAuth2 프로바이더 통합
+ *        — Google / GitHub / Discord / Microsoft / Facebook / Naver / Kakao
  *
  * 흐름:
  *   1. GET /auth/{provider}/login  → 302 redirect to provider
@@ -534,10 +535,14 @@ get(std::string_view url, std::string_view extra_headers = "")
  *         → state CSRF 검증 → 코드 교환 → 사용자 정보 조회 → JWT 발급
  *
  * 환경변수 설정:
- *   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
- *   NAVER_CLIENT_ID,  NAVER_CLIENT_SECRET
- *   KAKAO_CLIENT_ID,  KAKAO_CLIENT_SECRET
- *   OAUTH_REDIRECT_BASE   (예: https://your-domain.com)
+ *   GOOGLE_CLIENT_ID,    GOOGLE_CLIENT_SECRET
+ *   GITHUB_CLIENT_ID,    GITHUB_CLIENT_SECRET
+ *   DISCORD_CLIENT_ID,   DISCORD_CLIENT_SECRET
+ *   MICROSOFT_CLIENT_ID, MICROSOFT_CLIENT_SECRET, MICROSOFT_TENANT_ID
+ *   FACEBOOK_CLIENT_ID,  FACEBOOK_CLIENT_SECRET
+ *   NAVER_CLIENT_ID,     NAVER_CLIENT_SECRET
+ *   KAKAO_CLIENT_ID,     KAKAO_CLIENT_SECRET
+ *   OAUTH_REDIRECT_BASE  (예: https://your-domain.com)
  */
 
 #include "https_client.hpp"
@@ -1189,7 +1194,7 @@ find_package(OpenSSL REQUIRED)
 # ── qbuem-auth (header-only) ──────────────────────────────────────────────────
 # jwt.hpp        — HS256 JWT (qbuem::crypto only, no OpenSSL)
 # https_client.hpp — HTTPS 클라이언트 (OpenSSL BIO)
-# oauth.hpp      — Google / Naver / Kakao OAuth2
+# oauth.hpp      — Google / GitHub / Discord / Microsoft / Facebook / Naver / Kakao OAuth2
 add_library(qbuem_auth INTERFACE)
 target_include_directories(qbuem_auth INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(qbuem_auth INTERFACE
