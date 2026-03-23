@@ -36,9 +36,13 @@ std::optional<std::string_view> t = jwt::extract_bearer(auth_header);
 
 ## HTTPS 클라이언트 핵심 구조
 
-OpenSSL BIO 블로킹 I/O를 별도 std::thread에서 실행.
-eventfd를 Reactor에 등록하여 완료 시 코루틴 재개 (Reactor 스레드 비블로킹).
-ssl_init()은 std::call_once로 스레드 안전 초기화.
+고성능 설계:
+- ThreadPool::global() — hardware_concurrency() 워커 풀. 요청마다 OS 스레드 생성·파괴 없음.
+- ConnPool::global()   — 호스트:포트별 TLS 커넥션 재사용 (최대 4개, 25s idle timeout).
+                         Connection: keep-alive + Content-Length 기반 수신으로 핸드셰이크 비용 제거.
+- shared_ssl_ctx()     — SSL_CTX 프로세스당 1회 생성.
+- zero-copy body       — erase-front + move, 별도 resp_body 할당 없음.
+- EventFdAwaiter       — Reactor 스레드 비블로킹.
 
 ```cpp
 auto resp = co_await https::post(url, body);                          // POST
@@ -84,11 +88,14 @@ state_store (CSRF, 프로바이더보다 먼저 선언됨):
 - authorize_url()의 state 파라미터 qbuem::url_encode() 적용
   (CSRF 토큰 내 URL 특수문자 안전 처리)
 
-JSON 파싱: json_get_field()가 문자열/정수/null 모두 처리 (null → "").
-중첩 객체: json_get_obj()로 "key":{ 내부 추출 (Naver/Kakao/Facebook 공통).
-  주의: json_get_obj()는 객체 경계를 닫는 } 까지만 한정하지 않음.
-        외부 객체 필드가 동명 필드를 가질 경우 오탐 가능 (실제 OAuth 응답에서는 영향 없음).
+JSON 파싱:
+- json_get_field_view() — zero-copy fast-path. 이스케이프 없는 문자열 필드를 string_view로 반환.
+- json_get_field()      — 이스케이프 없으면 _view fast-path 사용, 이스케이프·스칼라·null 처리.
+- json_get_obj()        — "key":{ 내부를 string_view로 반환 (zero-copy).
+  주의: 객체 경계(닫는 }) 미한정 → 동명 외부 필드 오탐 가능성 (실 응답에서는 해당 없음).
 모든 userinfo 액세스 토큰은 Authorization Bearer 헤더로 전달.
+
+CSRF state_store: 16-shard FNV-1a 해시 기반 분산 mutex. 글로벌 단일 mutex 경합 제거.
 
 환경변수: {GOOGLE,NAVER,KAKAO,GITHUB,DISCORD,MICROSOFT,FACEBOOK}_{CLIENT_ID,CLIENT_SECRET}
           MICROSOFT_TENANT_ID (기본 common), OAUTH_REDIRECT_BASE

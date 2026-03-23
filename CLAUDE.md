@@ -25,15 +25,17 @@ src/auth/
 
 ## Zero-Copy: 현황 점검
 
-### ✅ 이미 zero-copy인 경로
+### ✅ zero-copy 적용 완료
 
 | 위치 | 내용 |
 |------|------|
 | `detail::json_get_obj()` | `std::string_view` 반환 — 파싱 결과 무복사 |
+| `detail::json_get_field_view()` | **신규** — 이스케이프 없는 문자열 필드 zero-copy. `json_get_field()` fast-path로 사용 |
 | `jwt::extract_bearer()` | `std::optional<std::string_view>` — 헤더 슬라이스 무복사 |
-| `do_https_blocking()` 인자 | 모두 `std::string_view` — 호출 인터페이스 무복사 |
+| `do_https()` 인자 | 모두 `std::string_view` — 호출 인터페이스 무복사 |
 | `jwt::encoded_header()` | `static const std::string` — 1회 생성 후 재사용 |
 | `state_store::verify_and_consume()` | `std::string_view` 인자 |
+| response body 헤더 제거 | `erase-front + move` — 별도 `resp_body` 할당 없음 |
 
 ### ❌ 고성능 구현 시 제거해야 할 복사 지점
 
@@ -151,72 +153,29 @@ auto pos = j.find(kAccessTokenKey);
 
 ## Zero-Latency: 현황 점검
 
-### ❌ 고성능 구현 시 제거해야 할 지연 요소
+### ✅ zero-latency 적용 완료
 
-#### 1. 요청마다 새 TLS 세션 생성 — 가장 큰 지연 요인
+| 항목 | 내용 |
+|------|------|
+| `SSL_CTX` 싱글톤 | 요청마다 `SSL_CTX_new` 제거 |
+| **스레드 풀** `ThreadPool` | OS 스레드 생성·파괴 제거. `hardware_concurrency()` 워커 |
+| **커넥션 풀** `ConnPool` | TLS 핸드셰이크 재사용. 호스트별 4개, 25s idle timeout |
+| **`Connection: keep-alive`** | 요청마다 TCP 연결 생성 제거 |
+| **`state_store` sharded lock** | 16-shard FNV-1a — 글로벌 mutex 경합 제거 |
 
-```
-현재 흐름 (exchange() 1회 = TLS 핸드셰이크 2~3회):
-  SSL_CTX_new → BIO_new_ssl_connect → BIO_do_connect → BIO_do_handshake
-  ↑ 토큰 요청 시 1회 + 사용자 정보 요청 시 1회 + (Microsoft: photo 1회)
-```
+### ❌ 남은 지연 요소 (향후 과제)
 
-**원인**: `https_client.hpp`의 `do_https_blocking()`이 매 호출마다 독립적인 TLS 연결을 생성하고 `Connection: close`로 닫음.
+#### `authorize_url()` — 매 호출마다 URL 재조립
 
-**고성능 대안**: 호스트별 TLS 연결 풀 (connection pool).
-- `std::unordered_map<std::string, BIO*>` 또는 `ssl_session` 재사용
-- TLS Session Resumption (SSL_SESSION 재사용)
+`client_id`, `redirect_uri`는 환경변수에서 정적으로 읽힘. `state` 부분만 교체하는 방식으로 캐싱 가능.
 
-#### 2. 요청마다 새 `std::thread` 생성 (`https_client.hpp:229-235`)
-
-```cpp
-std::thread([=]() mutable { ... }).detach();  // 매 요청마다 OS 스레드 생성
-```
-
-**고성능 대안**: 스레드 풀 (예: `qbuem::Executor` 또는 `std::async` + 고정 풀).
-
-#### 3. `SSL_CTX_new` 매 요청 생성
+#### `json_get_field` 패턴 문자열 — 호출마다 `std::format` 할당
 
 ```cpp
-SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());  // 매 요청마다
+auto k_str = std::format(R"("{}":")", key);  // 매 호출마다 heap 할당
 ```
 
-**고성능 대안**: `SSL_CTX` 전역 싱글톤 (인증서, 검증 설정 포함).
-```cpp
-// ssl_init()에서 ctx도 함께 초기화
-inline SSL_CTX* ssl_ctx() {
-    static SSL_CTX* ctx = []() { ... }();
-    return ctx;
-}
-```
-
-#### 4. `state_store` 글로벌 뮤텍스 — 고동시성 병목
-
-```cpp
-inline std::mutex g_mutex;  // 모든 프로바이더가 공유
-```
-
-**고성능 대안**: sharded lock (버킷별 뮤텍스) 또는 lock-free 구조.
-
-#### 5. `authorize_url()` — 매 호출마다 URL 재조립
-
-`std::format` 기반 URL 조립은 환경변수 값이 변하지 않는 한 캐싱 가능.
-`client_id`, `redirect_uri`는 정적이므로 `state` 부분만 교체하는 방식으로 최적화 가능.
-
----
-
-## 즉시 적용 가능한 개선 (하위 호환성 유지)
-
-우선순위 순:
-
-1. **`raw.substr(sep+4)` → in-place erase + move** (`https_client.hpp:148`)
-   - 2차 복사 1건 제거, 인터페이스 변경 없음
-
-2. **`SSL_CTX` 공유 싱글톤화** (`https_client.hpp:68`)
-   - `SSL_CTX_new` 비용 제거, 스레드 안전
-
-3. **`json_get_field` fast-path: 이스케이프 없는 경우 `string_view` 오버로드 추가**
-   - 기존 함수 유지하면서 고속 경로 추가
+컴파일 타임에 키가 알려진 경우 문자열 리터럴 직접 사용으로 제거 가능.
 
 ---
 

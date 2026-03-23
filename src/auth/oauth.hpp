@@ -28,6 +28,7 @@
 #include <qbuem/crypto.hpp>
 #include <qbuem/url.hpp>          // qbuem::url_encode / url_decode
 
+#include <array>
 #include <chrono>
 #include <format>
 #include <mutex>
@@ -70,11 +71,31 @@ parse_query(std::string_view qs) {
     return m;
 }
 
+// Zero-copy fast-path: 이스케이프 시퀀스 없는 문자열 필드를 string_view로 반환.
+// 이스케이프 포함이거나 필드가 없으면 빈 뷰 반환 (json_get_field로 fallback).
+// 반환 뷰의 수명은 json 파라미터와 동일.
+[[nodiscard]] inline std::string_view json_get_field_view(std::string_view json,
+                                                           std::string_view key) {
+    auto k = std::format(R"("{}":")", key);
+    auto pos = json.find(k);
+    if (pos == std::string_view::npos) return {};
+    pos += k.size();
+    auto start = pos;
+    while (pos < json.size() && json[pos] != '"' && json[pos] != '\\')
+        ++pos;
+    if (pos >= json.size() || json[pos] == '\\') return {};  // 이스케이프 or 미종료
+    return json.substr(start, pos - start);
+}
+
 // JSON에서 문자열 필드 추출 ("key":"val") — JSON 이스케이프 시퀀스 완전 처리
 // 스칼라 필드 ("key":123/true/null)도 지원
 [[nodiscard]] inline std::string json_get_field(std::string_view json,
                                                  std::string_view key) {
     // ── 문자열 형식: "key":"value" ──────────────────────────────────────────
+    // Fast path: 이스케이프 없는 경우 zero-copy view → string 변환
+    if (auto v = json_get_field_view(json, key); !v.empty())
+        return std::string{v};
+
     auto k_str = std::format(R"("{}":")", key);
     auto pos   = json.find(k_str);
     if (pos != std::string_view::npos) {
@@ -144,33 +165,53 @@ inline std::string redirect_base() {
 
 } // namespace detail
 
-// ── CSRF state 관리 (인메모리, TTL 10분, 스레드 안전) ────────────────────────
+// ── CSRF state 관리 (인메모리, TTL 10분, 샤딩된 스레드 안전) ───────────────────
 // 모든 프로바이더가 공유하므로 프로바이더 선언보다 먼저 위치해야 합니다.
+// 단일 글로벌 mutex 대신 kShards개의 독립 mutex로 경합 분산.
 
 namespace state_store {
 
 struct Entry { int64_t exp; };
-inline std::unordered_map<std::string, Entry> g_states;
-inline std::mutex g_mutex;
 
-// 만료된 엔트리 정리 (내부용, mutex 보유 상태에서 호출)
-inline void purge_expired_locked(int64_t now) {
-    for (auto it = g_states.begin(); it != g_states.end(); ) {
-        if (it->second.exp < now) it = g_states.erase(it);
+namespace detail_ss {
+
+inline constexpr size_t kShards = 16;
+
+struct Shard {
+    std::mutex                              mutex;
+    std::unordered_map<std::string, Entry>  states;
+};
+
+// 샤드 배열은 inline variable로 ODR-safe 전역 공유
+inline std::array<Shard, kShards> g_shards;
+
+[[nodiscard]] inline Shard& shard_for(std::string_view key) {
+    // FNV-1a 기반 빠른 해시 (std::hash<string_view>는 구현 의존적이라 직접 사용)
+    size_t h = 14695981039346656037ull;
+    for (unsigned char c : key) h = (h ^ c) * 1099511628211ull;
+    return g_shards[h % kShards];
+}
+
+inline void purge_expired_locked(Shard& shard, int64_t now) {
+    for (auto it = shard.states.begin(); it != shard.states.end(); ) {
+        if (it->second.exp < now) it = shard.states.erase(it);
         else ++it;
     }
 }
 
-/// CSRF 토큰 발급 (TTL 10분). issue() 호출 시 만료 토큰 자동 정리.
+} // namespace detail_ss
+
+/// CSRF 토큰 발급 (TTL 10분). 해당 샤드의 만료 토큰 자동 정리.
 inline std::string issue() {
     using namespace std::chrono;
     const int64_t now = duration_cast<seconds>(
         system_clock::now().time_since_epoch()).count();
     auto state = qbuem::crypto::csrf_token(128);
 
-    std::lock_guard lock{g_mutex};
-    purge_expired_locked(now);
-    g_states[state] = {now + 600};
+    auto& shard = detail_ss::shard_for(state);
+    std::lock_guard lock{shard.mutex};
+    detail_ss::purge_expired_locked(shard, now);
+    shard.states[state] = {now + 600};
     return state;
 }
 
@@ -180,11 +221,12 @@ inline bool verify_and_consume(std::string_view state) {
     const int64_t now = duration_cast<seconds>(
         system_clock::now().time_since_epoch()).count();
 
-    std::lock_guard lock{g_mutex};
-    auto it = g_states.find(std::string{state});
-    if (it == g_states.end()) return false;
+    auto& shard = detail_ss::shard_for(state);
+    std::lock_guard lock{shard.mutex};
+    auto it = shard.states.find(std::string{state});
+    if (it == shard.states.end()) return false;
     bool valid = (it->second.exp >= now);
-    g_states.erase(it);
+    shard.states.erase(it);
     return valid;
 }
 
