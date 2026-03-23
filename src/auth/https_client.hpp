@@ -43,13 +43,21 @@ struct Response {
 
 namespace detail {
 
-inline void ssl_init() {
-    static std::once_flag flag;
-    std::call_once(flag, []() {
+// SSL_CTX 공유 싱글톤 — 프로세스당 1회 생성, 모든 요청이 재사용
+// (zero-latency: 요청마다 SSL_CTX_new/free 비용 제거)
+// SSL_CTX는 내부적으로 reference-counted BIO를 사용하므로 스레드 안전
+inline SSL_CTX* shared_ssl_ctx() {
+    static SSL_CTX* ctx = []() -> SSL_CTX* {
         SSL_library_init();
         SSL_load_error_strings();
         OpenSSL_add_all_algorithms();
-    });
+        SSL_CTX* c = SSL_CTX_new(TLS_client_method());
+        if (!c) return nullptr;
+        SSL_CTX_set_default_verify_paths(c);
+        SSL_CTX_set_verify(c, SSL_VERIFY_PEER, nullptr);
+        return c;
+    }();
+    return ctx;
 }
 
 // ── 블로킹 HTTPS 요청 (별도 스레드에서 실행) ─────────────────────────────────
@@ -63,26 +71,18 @@ inline void ssl_init() {
     std::string_view content_type,
     std::string_view extra_headers = "")
 {
-    ssl_init();
-
-    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
-    if (!ctx) return {0, "SSL_CTX_new failed"};
-    SSL_CTX_set_default_verify_paths(ctx);
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
+    SSL_CTX* ctx = shared_ssl_ctx();
+    if (!ctx) return {0, "SSL_CTX init failed"};
 
     const std::string addr = std::format("{}:{}", host, port);
 
     BIO* bio = BIO_new_ssl_connect(ctx);
-    if (!bio) {
-        SSL_CTX_free(ctx);
-        return {0, "BIO_new_ssl_connect failed"};
-    }
+    if (!bio) return {0, "BIO_new_ssl_connect failed"};
 
     SSL* ssl = nullptr;
     BIO_get_ssl(bio, &ssl);
     if (!ssl) {
         BIO_free_all(bio);
-        SSL_CTX_free(ctx);
         return {0, "BIO_get_ssl failed"};
     }
 
@@ -95,7 +95,6 @@ inline void ssl_init() {
 
     if (BIO_do_connect(bio) <= 0 || BIO_do_handshake(bio) <= 0) {
         BIO_free_all(bio);
-        SSL_CTX_free(ctx);
         return {0, "connect/handshake failed"};
     }
 
@@ -130,7 +129,7 @@ inline void ssl_init() {
         raw.append(buf, static_cast<size_t>(n));
 
     BIO_free_all(bio);
-    SSL_CTX_free(ctx);
+    // ctx는 공유 싱글톤이므로 해제하지 않음
 
     // 상태 코드 파싱
     int status = 0;
@@ -141,13 +140,15 @@ inline void ssl_init() {
                             raw.data() + raw.size(), status);
     }
 
-    // 헤더와 바디 분리
+    // 헤더와 바디 분리 — substr 복사 대신 앞쪽 헤더를 in-place 제거 후 move
+    // (zero-copy: raw 버퍼를 재사용, resp_body 별도 할당 없음)
     auto sep = raw.find("\r\n\r\n");
-    std::string resp_body;
     if (sep != std::string::npos)
-        resp_body = raw.substr(sep + 4);
+        raw.erase(0, sep + 4);
+    else
+        raw.clear();
 
-    return {status, std::move(resp_body)};
+    return {status, std::move(raw)};
 }
 
 // URL 파싱 (host, port, path) 공통 헬퍼
