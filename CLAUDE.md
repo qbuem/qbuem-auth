@@ -1,201 +1,187 @@
-# qbuem-auth — 개발 가이드 (CLAUDE.md)
+# CLAUDE.md — qbuem-auth AI Context
 
-## 프로젝트 개요
+This file provides structured context for AI coding assistants working in this repository.
 
-C++23 헤더-온리 인증 라이브러리.
-HS256 JWT + 경량 비동기 HTTPS 클라이언트 + 7개 OAuth2 프로바이더 (Google / GitHub / Discord / Microsoft / Facebook / Naver / Kakao).
+---
+
+## Language Policy
+
+**All code, comments, documentation, and user-facing strings MUST be written in English.**
+
+Korean or other non-English text in code comments, docs, or strings is a review failure.
+Existing Korean comments in legacy files should be translated to English when touched.
+
+---
+
+## Project Overview
+
+C++23 header-only authentication library.
+HS256 JWT + lightweight async HTTPS client + 7 OAuth2 providers (Google / GitHub / Discord / Microsoft / Facebook / Naver / Kakao).
 
 ```
 src/auth/
-  jwt.hpp          — HS256 JWT 생성·검증 (qbuem::crypto only)
-  https_client.hpp — OpenSSL BIO + eventfd Reactor 비동기 래퍼
-  oauth.hpp        — OAuth2 프로바이더 (UserInfo 공통 구조)
+  jwt.hpp          — HS256 JWT signing and verification (qbuem::crypto only)
+  https_client.hpp — OpenSSL BIO + eventfd Reactor async wrapper
+  oauth.hpp        — OAuth2 providers with common UserInfo struct
 ```
 
 ---
 
-## 설계 원칙 및 고성능 구현 로드맵
+## Design Goals: Zero-Copy · Zero-Latency
 
-### 목표: Zero-Copy · Zero-Latency
-
-현재 구현은 정확성과 단순성을 우선으로 작성되었다.
-**고성능 버전에서는 아래의 복사 지점과 지연 요소를 제거해야 한다.**
+The current implementation prioritizes correctness and simplicity.
+**High-performance versions should eliminate the copy points and latency sources listed below.**
 
 ---
 
-## Zero-Copy: 현황 점검
+## Zero-Copy: Current Status
 
-### ✅ zero-copy 적용 완료
+### Applied
 
-| 위치 | 내용 |
-|------|------|
-| `detail::json_get_obj()` | `std::string_view` 반환 — 파싱 결과 무복사 |
-| `detail::json_get_field_view()` | **신규** — 이스케이프 없는 문자열 필드 zero-copy. `json_get_field()` fast-path로 사용 |
-| `jwt::extract_bearer()` | `std::optional<std::string_view>` — 헤더 슬라이스 무복사 |
-| `do_https()` 인자 | 모두 `std::string_view` — 호출 인터페이스 무복사 |
-| `jwt::encoded_header()` | `static const std::string` — 1회 생성 후 재사용 |
-| `state_store::verify_and_consume()` | `std::string_view` 인자 |
-| response body 헤더 제거 | `erase-front + move` — 별도 `resp_body` 할당 없음 |
+| Location | Detail |
+|----------|--------|
+| `detail::json_get_obj()` | Returns `std::string_view` — zero-copy parse result |
+| `detail::json_get_field_view()` | Fast-path for unescaped string fields — zero-copy |
+| `jwt::extract_bearer()` | Returns `std::optional<std::string_view>` — zero-copy header slice |
+| `do_https()` arguments | All `std::string_view` — zero-copy call interface |
+| `jwt::encoded_header()` | `static const std::string` — generated once, reused |
+| `state_store::verify_and_consume()` | `std::string_view` argument |
+| Response body header removal | `erase-front + move` — no separate `resp_body` allocation |
+| `Response::headers` map | All response headers parsed and lowercased during `do_request()` |
 
-### ❌ 고성능 구현 시 제거해야 할 복사 지점
+### Remaining Copy Points (future work)
 
-#### 1. `https::post()` / `https::get()` — 파라미터 방어 복사 (`https_client.hpp:223-225`)
+#### 1. `https::post()` / `https::get()` — defensive parameter copies (`https_client.hpp`)
 
 ```cpp
-// 현재: detached thread에 넘기기 위해 std::string으로 복사
+// Current: copied to std::string for detached thread hand-off
 std::string host_copy{host}, path_copy{path};
-std::string body_copy{body}, ct_copy{content_type};
-std::string hdrs_copy{extra_headers};
 ```
 
-**원인**: detached thread가 호출자보다 오래 살 수 있어 string_view가 댕글링될 위험.
-**고성능 대안**:
-- 스레드 풀(thread pool) + `std::packaged_task` → 코루틴이 await 중 string_view가 유효함을 보장
-- 또는 파라미터를 `std::string` 값으로 받아 move 전달 (`std::string&&`)
+**Root cause**: detached thread may outlive caller; `string_view` would dangle.
+**High-perf alternative**: thread pool + `std::packaged_task` so the coroutine awaits while `string_view` stays valid.
 
-#### 2. `do_https_blocking()` — 이중 버퍼링 (`https_client.hpp:125-148`)
+#### 2. `do_https_blocking()` — double buffering
 
 ```cpp
-// 현재: 스택 버퍼 → raw(std::string) → resp_body(std::string) 두 번 복사
+// Current: stack buffer → raw(std::string) → resp_body(std::string)
 char buf[4096];
 std::string raw;
-while ((n = BIO_read(bio, buf, sizeof(buf))) > 0)
-    raw.append(buf, n);               // 1차 복사: buf → raw
-
-resp_body = raw.substr(sep + 4);      // 2차 복사: raw 일부 → resp_body
+BIO_read(bio, buf, ...) → raw.append(...)  // copy 1
+resp_body = raw.substr(sep + 4);           // copy 2
 ```
 
-**고성능 대안**:
-- `BIO_read`를 직접 최종 버퍼에 수신 (헤더 크기를 먼저 파악 후 body 오프셋 계산)
-- 또는 `raw`에서 body 부분을 `substr` 대신 `move` + erase-front로 처리
-  ```cpp
-  raw.erase(0, sep + 4);    // body 앞 헤더 제거 → in-place, 재할당 없음
-  return {status, std::move(raw)};
-  ```
-  > **즉시 적용 가능**: `raw.substr(sep+4)`를 `raw.erase(0, sep+4); return {status, std::move(raw)};`로 교체하면 2차 복사 제거.
+**Immediate improvement available**: replace `raw.substr(sep+4)` with `raw.erase(0, sep+4); return {status, std::move(raw)};`.
 
-#### 3. `detail::json_get_field()` — 필드마다 heap 할당 (`oauth.hpp:75-123`)
+#### 3. `detail::json_get_field()` — heap allocation per field (`oauth.hpp`)
+
+**High-perf alternative**: `string_view` fast-path when no escape sequences present.
+
+#### 4. `UserInfo` — string copies from response body
+
+**High-perf alternative**: `shared_ptr<std::string>` body owner + `string_view` fields.
+
+#### 5. `jwt::extract_str()` — 5+ heap allocations per `decode()` call
+
+**High-perf alternative**: `string_view` fields when no escape sequences in JWT payload.
+
+---
+
+## Zero-Latency: Current Status
+
+### Applied
+
+| Item | Detail |
+|------|--------|
+| `SSL_CTX` singleton | `SSL_CTX_new` called once per process |
+| `ThreadPool` | `hardware_concurrency()` workers — no OS thread creation per request |
+| `ConnPool` | Per-host TLS connection reuse (max 4, 25s idle timeout) |
+| `Connection: keep-alive` | Eliminates per-request TCP setup |
+| `state_store` sharded lock | 16-shard FNV-1a — eliminates global mutex contention |
+
+### Remaining Latency Sources (future work)
+
+- `authorize_url()` rebuilds URL on every call — `state` part only changes, rest can be cached.
+- `json_get_field` pattern strings use `std::format` per call — replace with compile-time literals for known keys.
+
+---
+
+## Coding Rules
+
+- **New provider**: define `kName` constant → use `.provider = std::string{kName}` in `exchange()` (no hard-coded strings).
+- **`authorize_url()`**: `state` parameter must always go through `qbuem::url_encode(state)`.
+- **`json_get_obj()` result**: always guard with `empty()` check before use.
+- **Nested JSON**: chain `json_get_obj()` calls (see Naver/Kakao/Facebook patterns).
+- **Header strings**: `"HeaderName: value\r\n"` format, trailing `\r\n` required.
+- **Environment variables**: use `detail::env_or("KEY", "default")`.
+
+---
+
+## Response Struct
+
+`https::Response` exposes status, body, and all response headers:
 
 ```cpp
-// 현재: 추출 결과를 항상 std::string으로 반환 (heap 할당)
-std::string out;        // 문자열 필드
-return std::string{val}; // 스칼라 필드
-```
+struct Response {
+    int         status = 0;
+    std::string body;
+    std::unordered_map<std::string, std::string> headers;  // keys lowercased
 
-**원인**: 이스케이프 시퀀스 처리가 필요하므로 단순 view 반환 불가.
-**고성능 대안**:
-- **Fast path** (이스케이프 없음): `std::string_view` 반환 → 완전 zero-copy
-- **Slow path** (이스케이프 포함): 기존 `std::string` 반환
-- 시그니처 예시:
-  ```cpp
-  // variant 또는 별도 함수로 분리
-  std::string_view json_get_field_view(std::string_view json, std::string_view key);
-  std::string      json_get_field(std::string_view json, std::string_view key);
-  ```
-- **단, UserInfo 필드를 string_view로 바꾸면 response body의 수명 관리가 필요해짐.**
+    bool ok() const noexcept { return status >= 200 && status < 300; }
 
-#### 4. `UserInfo` — 응답 바디에서 추출한 문자열 재복사 (`oauth.hpp:43-49`)
-
-```cpp
-// 현재: 모든 필드가 std::string (response body에서 복사)
-struct UserInfo {
-    std::string provider;
-    std::string provider_id;
-    std::string email;
-    std::string name;
-    std::string avatar_url;
+    // Case-insensitive header lookup (keys already lowercased).
+    std::string_view header(std::string_view key) const noexcept;
 };
 ```
 
-**고성능 대안** (수명 관리 부담 있음):
+Usage:
 ```cpp
-// response body를 shared_ptr로 관리, UserInfo는 view만 보유
-struct UserInfo {
-    std::shared_ptr<std::string> _body;   // 소유권
-    std::string_view provider;
-    std::string_view provider_id;
-    std::string_view email;
-    std::string_view name;
-    std::string_view avatar_url;
-};
-```
-> provider는 kName을 가리키는 view이므로 수명 무관.
-
-#### 5. `jwt::extract_str()` — payload 파싱마다 heap 할당 (`jwt.hpp:139-170`)
-
-```cpp
-// 현재: decode()에서 extract_str() 5회 호출 → 최소 5번 heap 할당
-claims.provider = detail::extract_str(payload, "provider");
-claims.email    = detail::extract_str(payload, "email");
-claims.name     = detail::extract_str(payload, "name");
-```
-
-**고성능 대안**:
-- JWT payload의 문자열 필드는 우리가 직접 `json_str()`로 이스케이프하여 생성.
-  `provider`, `email`, `name`에 제어문자(`"`, `\`)가 없다고 검증된 경우 `string_view` 반환 가능.
-- `Claims` 구조체도 `string_view` 기반으로 전환 가능 (단, payload 수명 연장 필요).
-
-#### 6. `json_get_field`/`json_get_obj` 내부 패턴 문자열 — 호출마다 `std::format` 할당
-
-```cpp
-auto k_str = std::format(R"("{}":")", key);   // 매 호출마다 heap 할당
-auto k     = std::format(R"("{}":{{)", key);  // 매 호출마다 heap 할당
-```
-
-**고성능 대안**: 컴파일 타임 키가 알려진 경우 문자열 리터럴 직접 사용.
-```cpp
-// 예: json_get_field(j, "access_token") 대신
-constexpr auto kAccessTokenKey = R"("access_token":")";
-auto pos = j.find(kAccessTokenKey);
+auto resp = co_await https::get(url);
+auto retry_after = resp.header("retry-after");   // safe even if absent
+auto content_type = resp.header("content-type");
 ```
 
 ---
 
-## Zero-Latency: 현황 점검
+## Known Limitations
 
-### ✅ zero-latency 적용 완료
-
-| 항목 | 내용 |
-|------|------|
-| `SSL_CTX` 싱글톤 | 요청마다 `SSL_CTX_new` 제거 |
-| **스레드 풀** `ThreadPool` | OS 스레드 생성·파괴 제거. `hardware_concurrency()` 워커 |
-| **커넥션 풀** `ConnPool` | TLS 핸드셰이크 재사용. 호스트별 4개, 25s idle timeout |
-| **`Connection: keep-alive`** | 요청마다 TCP 연결 생성 제거 |
-| **`state_store` sharded lock** | 16-shard FNV-1a — 글로벌 mutex 경합 제거 |
-
-### ❌ 남은 지연 요소 (향후 과제)
-
-#### `authorize_url()` — 매 호출마다 URL 재조립
-
-`client_id`, `redirect_uri`는 환경변수에서 정적으로 읽힘. `state` 부분만 교체하는 방식으로 캐싱 가능.
-
-#### `json_get_field` 패턴 문자열 — 호출마다 `std::format` 할당
-
-```cpp
-auto k_str = std::format(R"("{}":")", key);  // 매 호출마다 heap 할당
-```
-
-컴파일 타임에 키가 알려진 경우 문자열 리터럴 직접 사용으로 제거 가능.
+- Chunked transfer encoding not supported — OAuth API responses are compact in practice.
+- `json_get_obj()` does not bound object scope — false positives possible for same-named outer fields (no real-world impact on actual OAuth responses).
+- `JWT_SECRET` truncated if > 32 bytes, zero-padded if < 32 bytes.
+- Microsoft `avatar_url` requires Bearer token (`/me/photo/$value` endpoint).
 
 ---
 
-## 코드 규칙
-
-- **새 프로바이더 추가 시**: `kName` 상수 정의 → `exchange()`에서 `.provider = std::string{kName}` 사용 (하드코딩 금지)
-- **`authorize_url()`**: `state` 파라미터는 반드시 `qbuem::url_encode(state)` 적용
-- **`json_get_obj()` 결과**: 빈 뷰 체크 후 사용 (`empty()` guard)
-- **중첩 JSON**: `json_get_obj()` 체이닝 사용 (Naver/Kakao/Facebook 패턴 참조)
-- **헤더 문자열**: `"HeaderName: value\r\n"` 형식, 마지막 `\r\n` 필수
-- **환경변수**: `detail::env_or("KEY", "default")` 사용
-
-## 알려진 한계 (현재 구현)
-
-- Chunked transfer encoding 미지원 — OAuth API 실응답은 compact, 실영향 낮음
-- `json_get_obj()` 객체 경계 미한정 — 동명 필드 오탐 가능성 (실응답 구조상 해당 없음)
-- `JWT_SECRET` 32바이트 초과 시 절단, 미만 시 zero-padding
-- Microsoft `avatar_url`은 Bearer 토큰 인증 필요 엔드포인트 (`/me/photo/$value`)
-
-## 의존성
+## Dependencies
 
 - **qbuem-stack**: `qbuem::crypto`, `qbuem::url_encode/decode`, `qbuem::Reactor`, `qbuem::Task<T>`
-- **OpenSSL**: HTTPS 아웃바운드 전용 (JWT에는 미사용)
+- **OpenSSL**: HTTPS outbound only (not used in JWT)
+
+---
+
+## Cross-Repo Guidelines
+
+### Ecosystem Map
+
+| Repo | Role | Key headers |
+|------|------|-------------|
+| **qbuem-stack** | Platform: async I/O, HTTP, pipelines, crypto, middleware | `<qbuem/http/*>`, `<qbuem/middleware/*>`, `<qbuem/crypto/*>` |
+| **qbuem-auth** | Auth layer: JWT, HTTPS client, OAuth2 | `src/auth/jwt.hpp`, `src/auth/https_client.hpp`, `src/auth/oauth.hpp` |
+| **qbuem-db** | DB layer: async drivers, ORM, migrations | `src/db/orm.hpp`, `src/db/*_driver.hpp` |
+| **application repos** | WAS applications built on the above | depend on stack + auth + db; must not duplicate platform code |
+
+### Filing Platform-Level Issues
+
+When implementing a feature here requires functionality that belongs in a lower-level library,
+**file an issue in the correct repo** rather than implementing it locally.
+
+| Need | File issue at |
+|------|--------------|
+| New async primitive, protocol, or middleware | [qbuem-stack issues](https://github.com/qbuem/qbuem-stack/issues) |
+| HTTPS client feature, JWT, OAuth provider | [qbuem-auth issues](https://github.com/qbuem/qbuem-auth/issues) |
+| DB driver, ORM, migration feature | [qbuem-db issues](https://github.com/qbuem/qbuem-db/issues) |
+
+If a temporary local workaround is necessary while waiting for an upstream fix, mark it:
+```cpp
+// TODO: remove after qbuem-auth#NNN is merged
+```
