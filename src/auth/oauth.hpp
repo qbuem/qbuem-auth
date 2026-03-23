@@ -236,7 +236,7 @@ struct GoogleProvider {
 
         const auto& j = info_resp.body;
         co_return UserInfo{
-            .provider    = "google",
+            .provider    = std::string{kName},
             .provider_id = detail::json_get_field(j, "sub"),
             .email       = detail::json_get_field(j, "email"),
             .name        = detail::json_get_field(j, "name"),
@@ -290,14 +290,11 @@ struct NaverProvider {
 
         // Naver 응답: {"resultcode":"00","message":"success","response":{...}}
         const auto& j = info_raw.body;
-        constexpr std::string_view kRespKey = R"("response":{)";
-        auto resp_start = j.find(kRespKey);
-        std::string_view resp_json = (resp_start != std::string::npos)
-            ? std::string_view{j}.substr(resp_start + kRespKey.size())
-            : std::string_view{j};
+        const auto resp_json = detail::json_get_obj(j, "response");
+        if (resp_json.empty()) co_return std::nullopt;
 
         co_return UserInfo{
-            .provider    = "naver",
+            .provider    = std::string{kName},
             .provider_id = detail::json_get_field(resp_json, "id"),
             .email       = detail::json_get_field(resp_json, "email"),
             .name        = detail::json_get_field(resp_json, "name"),
@@ -360,7 +357,7 @@ struct KakaoProvider {
         auto prof_json = detail::json_get_obj(acc_json, "profile");
 
         co_return UserInfo{
-            .provider    = "kakao",
+            .provider    = std::string{kName},
             .provider_id = id,
             .email       = detail::json_get_field(acc_json, "email"),
             .name        = detail::json_get_field(prof_json, "nickname"),
@@ -440,7 +437,7 @@ struct GitHubProvider {
         }
 
         co_return UserInfo{
-            .provider    = "github",
+            .provider    = std::string{kName},
             .provider_id = detail::json_get_field(j, "id"),
             .email       = email,
             .name        = detail::json_get_field(j, "name"),
@@ -509,7 +506,7 @@ struct DiscordProvider {
             name = detail::json_get_field(j, "username");
 
         co_return UserInfo{
-            .provider    = "discord",
+            .provider    = std::string{kName},
             .provider_id = id,
             .email       = detail::json_get_field(j, "email"),
             .name        = name,
@@ -573,12 +570,20 @@ struct MicrosoftProvider {
         if (email.empty())
             email = detail::json_get_field(j, "userPrincipalName");
 
+        // Graph API 프로필 사진은 /me/photo/$value 에서 바이너리로 반환됨.
+        // 공개 URL이 없으므로 엔드포인트 경로를 저장하여 호출자가 Bearer 토큰으로 직접 요청하도록 함.
+        const auto photo_meta_resp = co_await https::get(
+            "https://graph.microsoft.com/v1.0/me/photo", auth_header);
+        const std::string avatar_url = photo_meta_resp.ok()
+            ? "https://graph.microsoft.com/v1.0/me/photo/$value"
+            : std::string{};
+
         co_return UserInfo{
-            .provider    = "microsoft",
+            .provider    = std::string{kName},
             .provider_id = detail::json_get_field(j, "id"),
             .email       = email,
             .name        = detail::json_get_field(j, "displayName"),
-            .avatar_url  = {},  // Graph API 프로필 사진은 별도 /me/photo/$value 엔드포인트
+            .avatar_url  = avatar_url,
         };
     }
 };
@@ -636,7 +641,7 @@ struct FacebookProvider {
         auto avatar_url = detail::json_get_field(pic_inner, "url");
 
         co_return UserInfo{
-            .provider    = "facebook",
+            .provider    = std::string{kName},
             .provider_id = detail::json_get_field(j, "id"),
             .email       = detail::json_get_field(j, "email"),
             .name        = detail::json_get_field(j, "name"),
