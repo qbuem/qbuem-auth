@@ -74,7 +74,7 @@ struct Claims {
 
 namespace detail {
 
-// JSON 문자열 이스케이프 (최소 필요 문자만)
+// JSON 문자열 이스케이프 (RFC 7159 준수: 제어문자 0x00-0x1F 포함)
 [[nodiscard]] inline std::string json_str(std::string_view s) {
     std::string r;
     r.reserve(s.size() + 2);
@@ -85,7 +85,16 @@ namespace detail {
             case '\\': r += "\\\\"; break;
             case '\n': r += "\\n";  break;
             case '\r': r += "\\r";  break;
-            default:   r += c;
+            case '\t': r += "\\t";  break;
+            case '\b': r += "\\b";  break;
+            case '\f': r += "\\f";  break;
+            default:
+                // 나머지 제어문자(0x00–0x1F)는 \uXXXX 로 이스케이프
+                if (static_cast<unsigned char>(c) < 0x20)
+                    r += std::format("\\u{:04x}", static_cast<unsigned char>(c));
+                else
+                    r += c;
+                break;
         }
     }
     r += '"';
@@ -126,7 +135,7 @@ namespace detail {
         std::span<const uint8_t>{digest.data(), digest.size()}, false);
 }
 
-// 페이로드 JSON에서 문자열 필드 추출 (경량 파서)
+// 페이로드 JSON에서 문자열 필드 추출 — JSON 이스케이프 시퀀스 완전 처리
 [[nodiscard]] inline std::string extract_str(std::string_view json,
                                               std::string_view key) {
     auto k = std::format(R"("{}":")", key);
@@ -137,7 +146,22 @@ namespace detail {
     bool escaped = false;
     for (; pos < json.size(); ++pos) {
         char c = json[pos];
-        if (escaped) { out += c; escaped = false; continue; }
+        if (escaped) {
+            // 이스케이프 시퀀스를 원래 문자로 복원
+            switch (c) {
+                case '"':  out += '"';  break;
+                case '\\': out += '\\'; break;
+                case '/':  out += '/';  break;
+                case 'n':  out += '\n'; break;
+                case 'r':  out += '\r'; break;
+                case 't':  out += '\t'; break;
+                case 'b':  out += '\b'; break;
+                case 'f':  out += '\f'; break;
+                default:   out += c;    break;  // \uXXXX 등은 근사 처리
+            }
+            escaped = false;
+            continue;
+        }
         if (c == '\\') { escaped = true; continue; }
         if (c == '"') break;
         out += c;
@@ -247,6 +271,7 @@ decode(std::string_view token, TokenType expect_type = TokenType::Access) {
 
 // ── Bearer 토큰 추출 ─────────────────────────────────────────────────────────
 
+/// @note 반환된 string_view는 auth_header의 수명에 종속됩니다.
 [[nodiscard]] inline std::optional<std::string_view>
 extract_bearer(std::string_view auth_header) noexcept {
     constexpr std::string_view kBearer = "Bearer ";

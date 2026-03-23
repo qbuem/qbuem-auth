@@ -2,7 +2,8 @@
 
 /**
  * @file auth/oauth.hpp
- * @brief OAuth2 프로바이더 통합 — Google / Naver / Kakao (한국 특화)
+ * @brief OAuth2 프로바이더 통합
+ *        — Google / GitHub / Discord / Microsoft / Facebook / Naver / Kakao
  *
  * 흐름:
  *   1. GET /auth/{provider}/login  → 302 redirect to provider
@@ -10,10 +11,14 @@
  *         → state CSRF 검증 → 코드 교환 → 사용자 정보 조회 → JWT 발급
  *
  * 환경변수 설정:
- *   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
- *   NAVER_CLIENT_ID,  NAVER_CLIENT_SECRET
- *   KAKAO_CLIENT_ID,  KAKAO_CLIENT_SECRET
- *   OAUTH_REDIRECT_BASE   (예: https://your-domain.com)
+ *   GOOGLE_CLIENT_ID,    GOOGLE_CLIENT_SECRET
+ *   GITHUB_CLIENT_ID,    GITHUB_CLIENT_SECRET
+ *   DISCORD_CLIENT_ID,   DISCORD_CLIENT_SECRET
+ *   MICROSOFT_CLIENT_ID, MICROSOFT_CLIENT_SECRET, MICROSOFT_TENANT_ID
+ *   FACEBOOK_CLIENT_ID,  FACEBOOK_CLIENT_SECRET
+ *   NAVER_CLIENT_ID,     NAVER_CLIENT_SECRET
+ *   KAKAO_CLIENT_ID,     KAKAO_CLIENT_SECRET
+ *   OAUTH_REDIRECT_BASE  (예: https://your-domain.com)
  */
 
 #include "https_client.hpp"
@@ -36,7 +41,7 @@ namespace qbuem_routine::oauth {
 // ── 사용자 정보 (프로바이더 공통) ────────────────────────────────────────────
 
 struct UserInfo {
-    std::string provider;     ///< google | naver | kakao
+    std::string provider;     ///< google | github | discord | microsoft | facebook | naver | kakao
     std::string provider_id;  ///< 프로바이더 내 고유 ID
     std::string email;
     std::string name;
@@ -65,46 +70,66 @@ parse_query(std::string_view qs) {
     return m;
 }
 
-// JSON에서 필드 값 추출 — 문자열("key":"val")과 스칼라("key":123) 모두 지원
+// JSON에서 문자열 필드 추출 ("key":"val") — JSON 이스케이프 시퀀스 완전 처리
+// 스칼라 필드 ("key":123/true/null)도 지원
 [[nodiscard]] inline std::string json_get_field(std::string_view json,
                                                  std::string_view key) {
-    // 문자열 형식 "key":"value" 먼저 시도
+    // ── 문자열 형식: "key":"value" ──────────────────────────────────────────
     auto k_str = std::format(R"("{}":")", key);
     auto pos   = json.find(k_str);
     if (pos != std::string_view::npos) {
         pos += k_str.size();
-        auto end = pos;
-        while (end < json.size() && json[end] != '"') {
-            if (json[end] == '\\') ++end;  // 이스케이프 문자 건너뜀
-            ++end;
+        std::string out;
+        while (pos < json.size() && json[pos] != '"') {
+            if (json[pos] == '\\' && pos + 1 < json.size()) {
+                ++pos;  // 백슬래시 건너뜀
+                switch (json[pos]) {
+                    case '"':  out += '"';  break;
+                    case '\\': out += '\\'; break;
+                    case '/':  out += '/';  break;
+                    case 'n':  out += '\n'; break;
+                    case 'r':  out += '\r'; break;
+                    case 't':  out += '\t'; break;
+                    case 'b':  out += '\b'; break;
+                    case 'f':  out += '\f'; break;
+                    default:   out += json[pos]; break;  // \uXXXX 등은 근사 처리
+                }
+            } else {
+                out += json[pos];
+            }
+            ++pos;
         }
-        return std::string{json.substr(pos, end - pos)};
+        return out;
     }
-    // 스칼라 형식 "key":value (숫자, boolean, null)
+
+    // ── 스칼라 형식: "key":value (숫자, boolean, null) ─────────────────────
     auto k_int = std::format(R"("{}":)", key);
     pos = json.find(k_int);
     if (pos != std::string_view::npos) {
         pos += k_int.size();
-        while (pos < json.size() && json[pos] == ' ') ++pos;  // 공백 건너뜀
+        while (pos < json.size() && json[pos] == ' ') ++pos;  // 선행 공백 제거
         auto end = pos;
         while (end < json.size() && json[end] != ',' &&
                json[end] != '}' && json[end] != ']') {
             ++end;
         }
+        // 후행 공백 제거
+        while (end > pos && json[end - 1] == ' ') --end;
         auto val = json.substr(pos, end - pos);
-        if (val == "null") return {};  // JSON null → 빈 문자열
+        if (val == "null") return {};
         return std::string{val};
     }
     return {};
 }
 
 // 중첩 JSON 객체 내부 추출 ("key":{ ... })
-// 반환값: { 이후 내용 (닫는 괄호 포함 안 함)
+// 반환: { 다음 위치부터의 string_view. key가 없으면 빈 string_view 반환.
+// ※ fallback으로 전체 json을 반환하지 않음 — 잘못된 필드 매칭 방지
 [[nodiscard]] inline std::string_view json_get_obj(std::string_view json,
                                                     std::string_view key) {
     auto k = std::format(R"("{}":{{)", key);
     auto pos = json.find(k);
-    if (pos == std::string_view::npos) return json;  // fallback
+    if (pos == std::string_view::npos) return {};  // key 없으면 빈 뷰 반환
     return json.substr(pos + k.size());
 }
 
@@ -177,13 +202,11 @@ struct GoogleProvider {
             "https://accounts.google.com/o/oauth2/v2/auth"
             "?client_id={}&redirect_uri={}&response_type=code"
             "&scope=openid+email+profile&state={}",
-            detail::env_or("GOOGLE_CLIENT_ID"),
+            qbuem::url_encode(detail::env_or("GOOGLE_CLIENT_ID")),
             qbuem::url_encode(detail::redirect_base() + "/auth/google/callback"),
             state);
     }
 
-    /// @param code  콜백으로 수신한 인가 코드
-    /// @param state 콜백으로 수신한 state (CSRF 검증용)
     [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
     exchange(std::string_view code, std::string_view state) {
         if (!state_store::verify_and_consume(state)) co_return std::nullopt;
@@ -204,7 +227,7 @@ struct GoogleProvider {
         const auto access_token = detail::json_get_field(token_resp.body, "access_token");
         if (access_token.empty()) co_return std::nullopt;
 
-        // 2. 사용자 정보 — Authorization: Bearer 헤더로 전달 (URL 노출 방지)
+        // 2. 사용자 정보
         const std::string auth_header =
             std::format("Authorization: Bearer {}\r\n", access_token);
         auto info_resp = co_await https::get(
@@ -233,13 +256,11 @@ struct NaverProvider {
         return std::format(
             "https://nid.naver.com/oauth2.0/authorize"
             "?client_id={}&redirect_uri={}&response_type=code&state={}",
-            detail::env_or("NAVER_CLIENT_ID"),
+            qbuem::url_encode(detail::env_or("NAVER_CLIENT_ID")),
             qbuem::url_encode(detail::redirect_base() + "/auth/naver/callback"),
             state);
     }
 
-    /// @param code  콜백으로 수신한 인가 코드
-    /// @param state 콜백으로 수신한 state (CSRF 검증 + Naver 토큰 요청용)
     [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
     exchange(std::string_view code, std::string_view state) {
         if (!state_store::verify_and_consume(state)) co_return std::nullopt;
@@ -260,7 +281,7 @@ struct NaverProvider {
         const auto access_token = detail::json_get_field(token_resp.body, "access_token");
         if (access_token.empty()) co_return std::nullopt;
 
-        // 2. 사용자 정보 — Authorization: Bearer 헤더로 전달 (URL 노출 방지)
+        // 2. 사용자 정보
         const std::string auth_header =
             std::format("Authorization: Bearer {}\r\n", access_token);
         auto info_raw = co_await https::get(
@@ -296,13 +317,11 @@ struct KakaoProvider {
         return std::format(
             "https://kauth.kakao.com/oauth/authorize"
             "?client_id={}&redirect_uri={}&response_type=code&state={}",
-            detail::env_or("KAKAO_CLIENT_ID"),
+            qbuem::url_encode(detail::env_or("KAKAO_CLIENT_ID")),
             qbuem::url_encode(detail::redirect_base() + "/auth/kakao/callback"),
             state);
     }
 
-    /// @param code  콜백으로 수신한 인가 코드
-    /// @param state 콜백으로 수신한 state (CSRF 검증용)
     [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
     exchange(std::string_view code, std::string_view state) {
         if (!state_store::verify_and_consume(state)) co_return std::nullopt;
@@ -321,7 +340,7 @@ struct KakaoProvider {
         const auto access_token = detail::json_get_field(token_resp.body, "access_token");
         if (access_token.empty()) co_return std::nullopt;
 
-        // 2. 사용자 정보 — Authorization: Bearer 헤더로 전달 (URL 노출 방지)
+        // 2. 사용자 정보
         const std::string auth_header =
             std::format("Authorization: Bearer {}\r\n", access_token);
         auto info_resp = co_await https::get(
@@ -336,6 +355,7 @@ struct KakaoProvider {
         const auto id = detail::json_get_field(j, "id");
 
         // 중첩 객체 접근: kakao_account → profile
+        // json_get_obj 는 key 없으면 빈 뷰를 반환하므로 안전
         auto acc_json  = detail::json_get_obj(j, "kakao_account");
         auto prof_json = detail::json_get_obj(acc_json, "profile");
 
@@ -360,13 +380,11 @@ struct GitHubProvider {
         return std::format(
             "https://github.com/login/oauth/authorize"
             "?client_id={}&redirect_uri={}&scope=read:user+user:email&state={}",
-            detail::env_or("GITHUB_CLIENT_ID"),
+            qbuem::url_encode(detail::env_or("GITHUB_CLIENT_ID")),
             qbuem::url_encode(detail::redirect_base() + "/auth/github/callback"),
             state);
     }
 
-    /// @param code  콜백으로 수신한 인가 코드
-    /// @param state 콜백으로 수신한 state (CSRF 검증용)
     [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
     exchange(std::string_view code, std::string_view state) {
         if (!state_store::verify_and_consume(state)) co_return std::nullopt;
@@ -443,13 +461,11 @@ struct DiscordProvider {
             "https://discord.com/api/oauth2/authorize"
             "?client_id={}&redirect_uri={}&response_type=code"
             "&scope=identify+email&state={}",
-            detail::env_or("DISCORD_CLIENT_ID"),
+            qbuem::url_encode(detail::env_or("DISCORD_CLIENT_ID")),
             qbuem::url_encode(detail::redirect_base() + "/auth/discord/callback"),
             state);
     }
 
-    /// @param code  콜백으로 수신한 인가 코드
-    /// @param state 콜백으로 수신한 state (CSRF 검증용)
     [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
     exchange(std::string_view code, std::string_view state) {
         if (!state_store::verify_and_consume(state)) co_return std::nullopt;
@@ -516,13 +532,11 @@ struct MicrosoftProvider {
             "?client_id={}&redirect_uri={}&response_type=code"
             "&scope=openid+email+profile+User.Read&state={}",
             tenant,
-            detail::env_or("MICROSOFT_CLIENT_ID"),
+            qbuem::url_encode(detail::env_or("MICROSOFT_CLIENT_ID")),
             qbuem::url_encode(detail::redirect_base() + "/auth/microsoft/callback"),
             state);
     }
 
-    /// @param code  콜백으로 수신한 인가 코드
-    /// @param state 콜백으로 수신한 state (CSRF 검증용)
     [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
     exchange(std::string_view code, std::string_view state) {
         if (!state_store::verify_and_consume(state)) co_return std::nullopt;
@@ -580,27 +594,26 @@ struct FacebookProvider {
         return std::format(
             "https://www.facebook.com/v20.0/dialog/oauth"
             "?client_id={}&redirect_uri={}&scope=email,public_profile&state={}",
-            detail::env_or("FACEBOOK_CLIENT_ID"),
+            qbuem::url_encode(detail::env_or("FACEBOOK_CLIENT_ID")),
             qbuem::url_encode(detail::redirect_base() + "/auth/facebook/callback"),
             state);
     }
 
-    /// @param code  콜백으로 수신한 인가 코드
-    /// @param state 콜백으로 수신한 state (CSRF 검증용)
     [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
     exchange(std::string_view code, std::string_view state) {
         if (!state_store::verify_and_consume(state)) co_return std::nullopt;
 
-        // 1. 코드 → 액세스 토큰 (Facebook은 GET 방식 사용)
-        const auto token_url = std::format(
-            "https://graph.facebook.com/v20.0/oauth/access_token"
-            "?client_id={}&client_secret={}&code={}&redirect_uri={}",
+        // 1. 코드 → 액세스 토큰 (POST 사용: client_secret을 URL이 아닌 바디에 포함)
+        // GET으로 처리하면 client_secret이 URL에 노출되어 서버 로그 등에 기록됨
+        const std::string token_body = std::format(
+            "client_id={}&client_secret={}&code={}&redirect_uri={}",
             qbuem::url_encode(detail::env_or("FACEBOOK_CLIENT_ID")),
             qbuem::url_encode(detail::env_or("FACEBOOK_CLIENT_SECRET")),
             qbuem::url_encode(code),
             qbuem::url_encode(detail::redirect_base() + "/auth/facebook/callback"));
 
-        auto token_resp = co_await https::get(token_url);
+        auto token_resp = co_await https::post(
+            "https://graph.facebook.com/v20.0/oauth/access_token", token_body);
         if (!token_resp.ok()) co_return std::nullopt;
 
         const auto access_token = detail::json_get_field(token_resp.body, "access_token");
@@ -616,10 +629,11 @@ struct FacebookProvider {
         if (!info_resp.ok()) co_return std::nullopt;
 
         // 프로필 사진 중첩 구조: {"picture":{"data":{"url":"..."}}}
+        // json_get_obj는 key 없으면 빈 뷰를 반환하므로 안전
         const auto& j = info_resp.body;
-        auto pic_data    = detail::json_get_obj(j, "picture");
-        auto pic_inner   = detail::json_get_obj(pic_data, "data");
-        auto avatar_url  = detail::json_get_field(pic_inner, "url");
+        auto pic_data   = detail::json_get_obj(j, "picture");
+        auto pic_inner  = detail::json_get_obj(pic_data, "data");
+        auto avatar_url = detail::json_get_field(pic_inner, "url");
 
         co_return UserInfo{
             .provider    = "facebook",

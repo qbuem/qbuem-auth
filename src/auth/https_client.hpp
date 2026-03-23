@@ -25,7 +25,6 @@
 #include <string>
 #include <string_view>
 #include <thread>
-#include <vector>
 
 #include <sys/eventfd.h>
 #include <unistd.h>
@@ -68,17 +67,30 @@ inline void ssl_init() {
 
     SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx) return {0, "SSL_CTX_new failed"};
-    // 인증서 검증 (시스템 CA 사용)
     SSL_CTX_set_default_verify_paths(ctx);
     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
 
     const std::string addr = std::format("{}:{}", host, port);
+
     BIO* bio = BIO_new_ssl_connect(ctx);
+    if (!bio) {
+        SSL_CTX_free(ctx);
+        return {0, "BIO_new_ssl_connect failed"};
+    }
+
     SSL* ssl = nullptr;
     BIO_get_ssl(bio, &ssl);
+    if (!ssl) {
+        BIO_free_all(bio);
+        SSL_CTX_free(ctx);
+        return {0, "BIO_get_ssl failed"};
+    }
+
     SSL_set_mode(ssl, SSL_MODE_AUTO_RETRY);
-    // SNI
-    SSL_set_tlsext_host_name(ssl, std::string(host).c_str());
+
+    // SNI: 임시 객체가 아닌 named string으로 전달 (포인터 유효성 보장)
+    const std::string host_str{host};
+    SSL_set_tlsext_host_name(ssl, host_str.c_str());
     BIO_set_conn_hostname(bio, addr.c_str());
 
     if (BIO_do_connect(bio) <= 0 || BIO_do_handshake(bio) <= 0) {
@@ -93,10 +105,13 @@ inline void ssl_init() {
         "Host: {}\r\n",
         method, path, host);
 
-    if (!content_type.empty())
-        req += std::format("Content-Type: {}\r\n", content_type);
-
-    req += std::format("Content-Length: {}\r\n", body.size());
+    // Content-Type / Content-Length는 바디가 있을 때만 전송
+    // (GET 등 바디 없는 요청에 Content-Length: 0을 보내면 일부 서버가 거부)
+    if (!body.empty()) {
+        if (!content_type.empty())
+            req += std::format("Content-Type: {}\r\n", content_type);
+        req += std::format("Content-Length: {}\r\n", body.size());
+    }
 
     if (!extra_headers.empty())
         req += extra_headers;
@@ -192,7 +207,7 @@ struct EventFdAwaiter {
  * @param url          전체 URL (https://host/path?query)
  * @param body         요청 바디
  * @param content_type Content-Type 헤더 값
- * @param extra_headers 추가 헤더 문자열 (각 줄 \r\n 으로 끝나야 함, 예: "Authorization: Bearer token\r\n")
+ * @param extra_headers 추가 헤더 문자열 (각 줄 \r\n 으로 끝나야 함)
  */
 [[nodiscard]] inline qbuem::Task<Response>
 post(std::string_view url, std::string_view body,
@@ -209,11 +224,14 @@ post(std::string_view url, std::string_view body,
     std::string body_copy{body}, ct_copy{content_type};
     std::string hdrs_copy{extra_headers};
 
-    std::thread([=, result]() mutable {
+    // [=] 로 캡처: result(shared_ptr), efd, 문자열들 모두 값 복사
+    // [=, result] 는 C++ 표준상 중복 캡처 오류이므로 [=] 사용
+    std::thread([=]() mutable {
         *result = detail::do_https_blocking(host_copy, port, "POST",
                                             path_copy, body_copy, ct_copy, hdrs_copy);
         uint64_t one = 1;
         ::write(efd, &one, sizeof(one));
+        // efd는 write 완료 후 코루틴이 close()하므로 여기서 닫지 않음
     }).detach();
 
     co_await EventFdAwaiter{efd};
@@ -237,7 +255,7 @@ get(std::string_view url, std::string_view extra_headers = "")
     auto result = std::make_shared<Response>();
     std::string h{host}, p{path}, hdrs{extra_headers};
 
-    std::thread([=, result]() mutable {
+    std::thread([=]() mutable {
         *result = detail::do_https_blocking(h, port, "GET", p, "", "", hdrs);
         uint64_t one = 1;
         ::write(efd, &one, sizeof(one));
