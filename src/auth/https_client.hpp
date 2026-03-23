@@ -276,30 +276,26 @@ do_request(BIO*             bio,
     const std::string pool_key = std::format("{}:{}", host, port);
     auto& pool = ConnPool::global();
 
-    auto manage = [&](BIO* bio) -> bool {
+    // 커넥션 관리 헬퍼: 요청 수행 후 결과에 따라 pool 반환 또는 폐기
+    // nullopt(stale) → BIO 폐기, false 반환
+    // ok + reusable  → pool 반환, Response 이동
+    // ok + !reusable → BIO 폐기, Response 이동
+    auto try_conn = [&](BIO* bio) -> std::optional<Response> {
         auto res = do_request(bio, host, method, path, body, content_type, extra_headers);
-        if (!res) { BIO_free_all(bio); return false; }
+        if (!res) { BIO_free_all(bio); return std::nullopt; }
         auto& [resp, reusable] = *res;
         if (reusable) pool.release(pool_key, bio);
         else          BIO_free_all(bio);
-        return true;
+        return std::move(resp);
     };
 
     // 1. 풀에서 재사용 시도
     if (BIO* bio = pool.acquire(pool_key)) {
-        auto res = do_request(bio, host, method, path, body, content_type, extra_headers);
-        if (res) {
-            auto& [resp, reusable] = *res;
-            if (reusable) pool.release(pool_key, bio);
-            else          BIO_free_all(bio);
-            return std::move(resp);
-        }
-        BIO_free_all(bio);  // stale 커넥션 폐기 → 신규 연결로 재시도
+        if (auto resp = try_conn(bio)) return std::move(*resp);
+        // try_conn이 nullopt → stale 커넥션 폐기 완료, 신규 연결로 재시도
     }
 
     // 2. 신규 TLS 연결
-    const std::string addr = std::format("{}:{}", host, port);
-
     BIO* bio = BIO_new_ssl_connect(ctx);
     if (!bio) return {0, "BIO_new_ssl_connect failed"};
 
@@ -310,20 +306,15 @@ do_request(BIO*             bio,
     SSL_set_mode(ssl, SSL_MODE_AUTO_RETRY);
     const std::string host_str{host};
     SSL_set_tlsext_host_name(ssl, host_str.c_str());
-    BIO_set_conn_hostname(bio, addr.c_str());
+    BIO_set_conn_hostname(bio, pool_key.c_str());
 
     if (BIO_do_connect(bio) <= 0 || BIO_do_handshake(bio) <= 0) {
         BIO_free_all(bio);
         return {0, "connect/handshake failed"};
     }
 
-    auto res = do_request(bio, host, method, path, body, content_type, extra_headers);
-    if (!res) { BIO_free_all(bio); return {0, "request failed"}; }
-
-    auto& [resp, reusable] = *res;
-    if (reusable) pool.release(pool_key, bio);
-    else          BIO_free_all(bio);
-    return std::move(resp);
+    if (auto resp = try_conn(bio)) return std::move(*resp);
+    return {0, "request failed"};
 }
 
 // ── URL 파싱 ─────────────────────────────────────────────────────────────────

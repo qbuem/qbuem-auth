@@ -397,14 +397,21 @@ struct KakaoProvider {
         // kakao_account 누락은 비정상 응답 — nullopt 반환
         auto acc_json  = detail::json_get_obj(j, "kakao_account");
         if (acc_json.empty()) co_return std::nullopt;
+
+        // profile 누락 시 name/avatar_url은 빈 문자열로 처리 (치명적 오류 아님)
         auto prof_json = detail::json_get_obj(acc_json, "profile");
+        std::string name, avatar_url;
+        if (!prof_json.empty()) {
+            name       = detail::json_get_field(prof_json, "nickname");
+            avatar_url = detail::json_get_field(prof_json, "profile_image_url");
+        }
 
         co_return UserInfo{
             .provider    = std::string{kName},
             .provider_id = id,
             .email       = detail::json_get_field(acc_json, "email"),
-            .name        = detail::json_get_field(prof_json, "nickname"),
-            .avatar_url  = detail::json_get_field(prof_json, "profile_image_url"),
+            .name        = name,
+            .avatar_url  = avatar_url,
         };
     }
 };
@@ -677,11 +684,13 @@ struct FacebookProvider {
         if (!info_resp.ok()) co_return std::nullopt;
 
         // 프로필 사진 중첩 구조: {"picture":{"data":{"url":"..."}}}
-        // json_get_obj는 key 없으면 빈 뷰를 반환하므로 안전
+        // 각 단계마다 empty() guard 적용 — 누락 시 빈 avatar_url
         const auto& j = info_resp.body;
-        auto pic_data   = detail::json_get_obj(j, "picture");
-        auto pic_inner  = detail::json_get_obj(pic_data, "data");
-        auto avatar_url = detail::json_get_field(pic_inner, "url");
+        std::string avatar_url;
+        if (auto pic_data = detail::json_get_obj(j, "picture"); !pic_data.empty()) {
+            if (auto pic_inner = detail::json_get_obj(pic_data, "data"); !pic_inner.empty())
+                avatar_url = detail::json_get_field(pic_inner, "url");
+        }
 
         co_return UserInfo{
             .provider    = std::string{kName},
