@@ -47,7 +47,32 @@ namespace qbuem_routine::https {
 struct Response {
     int         status = 0;
     std::string body;
-    bool        ok() const noexcept { return status >= 200 && status < 300; }
+    std::unordered_map<std::string, std::string> headers; ///< Lowercased header names → values
+
+    bool ok() const noexcept { return status >= 200 && status < 300; }
+
+    /**
+     * @brief Case-insensitive header lookup.
+     * @returns Header value, or empty string_view if absent.
+     */
+    std::string_view header(std::string_view key) const noexcept {
+        char buf[64];
+        const bool fits = key.size() < sizeof(buf);
+        if (fits) {
+            for (size_t i = 0; i < key.size(); ++i)
+                buf[i] = static_cast<char>(
+                    std::tolower(static_cast<unsigned char>(key[i])));
+            auto it = headers.find(std::string(std::string_view{buf, key.size()}));
+            return (it != headers.end()) ? std::string_view{it->second}
+                                         : std::string_view{};
+        }
+        std::string lower{key};
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        auto it = headers.find(lower);
+        return (it != headers.end()) ? std::string_view{it->second}
+                                     : std::string_view{};
+    }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -213,7 +238,7 @@ do_request(BIO*             bio,
         sep = raw.find("\r\n\r\n");
     }
 
-    // ── 상태 코드 파싱 ────────────────────────────────────────────────────────
+    // ── Status code parsing ──────────────────────────────────────────────────
     int status = 0;
     if (raw.starts_with("HTTP/")) {
         auto sp = raw.find(' ');
@@ -221,40 +246,67 @@ do_request(BIO*             bio,
             std::from_chars(raw.data() + sp + 1, raw.data() + raw.size(), status);
     }
 
-    // ── Content-Length 파싱 (대소문자 무관) ──────────────────────────────────
-    const std::string_view hdrs{raw.data(), sep};
-    size_t content_length = std::string::npos;  // npos = 알 수 없음
-
-    for (auto hdr : {"Content-Length: ", "content-length: "}) {
-        auto cl = hdrs.find(hdr);
-        if (cl != std::string_view::npos) {
-            cl += std::strlen(hdr);
-            size_t v = 0;
-            std::from_chars(hdrs.data() + cl, hdrs.data() + hdrs.size(), v);
-            content_length = v;
-            break;
+    // ── Parse response headers into map (skip status line) ──────────────────
+    Response resp;
+    resp.status = status;
+    {
+        std::string_view hdr_section{raw.data(), sep};
+        auto nl = hdr_section.find("\r\n");     // skip status line
+        if (nl != std::string_view::npos) {
+            hdr_section.remove_prefix(nl + 2);
+            while (!hdr_section.empty()) {
+                auto line_end = hdr_section.find("\r\n");
+                std::string_view line = (line_end != std::string_view::npos)
+                    ? hdr_section.substr(0, line_end)
+                    : hdr_section;
+                auto colon = line.find(':');
+                if (colon != std::string_view::npos) {
+                    std::string key{line.substr(0, colon)};
+                    std::transform(key.begin(), key.end(), key.begin(),
+                        [](unsigned char c){ return std::tolower(c); });
+                    std::string_view val = line.substr(colon + 1);
+                    while (!val.empty() && (val[0] == ' ' || val[0] == '\t'))
+                        val.remove_prefix(1);
+                    resp.headers.emplace(std::move(key), std::string{val});
+                }
+                if (line_end == std::string_view::npos) break;
+                hdr_section.remove_prefix(line_end + 2);
+            }
         }
     }
 
-    // ── 헤더 제거: in-place erase (zero-copy body) ────────────────────────────
+    // ── Content-Length lookup via populated headers map ──────────────────────
+    size_t content_length = std::string::npos;
+    {
+        auto it = resp.headers.find("content-length");
+        if (it != resp.headers.end()) {
+            size_t v = 0;
+            std::from_chars(it->second.data(),
+                            it->second.data() + it->second.size(), v);
+            content_length = v;
+        }
+    }
+
+    // ── Remove headers in-place; move remaining bytes into body ─────────────
     raw.erase(0, sep + 4);
 
     if (content_length != std::string::npos) {
-        // Content-Length 있음: 정확히 그 크기만큼 읽고 커넥션 재사용
+        // Content-Length present: read exactly that many bytes; connection reusable
         while (raw.size() < content_length) {
             int n = BIO_read(bio, buf,
                 static_cast<int>(std::min(sizeof(buf), content_length - raw.size())));
             if (n <= 0) break;
             raw.append(buf, static_cast<size_t>(n));
         }
-        return std::pair{Response{status, std::move(raw)}, true};
+        resp.body = std::move(raw);
+        return std::pair{std::move(resp), true};
     } else {
-        // Content-Length 없음: EOF까지 읽음 (chunked 또는 close)
-        // 커넥션 재사용 불가
+        // No Content-Length: read until EOF (chunked or close); connection not reusable
         int n;
         while ((n = BIO_read(bio, buf, sizeof(buf))) > 0)
             raw.append(buf, static_cast<size_t>(n));
-        return std::pair{Response{status, std::move(raw)}, false};
+        resp.body = std::move(raw);
+        return std::pair{std::move(resp), false};
     }
 }
 
