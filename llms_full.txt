@@ -272,10 +272,12 @@ extract_bearer(std::string_view auth_header) noexcept {
  * @file auth/https_client.hpp
  * @brief 경량 HTTPS 클라이언트 (OpenSSL BIO + eventfd 비동기 래퍼)
  *
- * OAuth 토큰 교환처럼 빈도가 낮은 아웃바운드 HTTPS 요청에 사용.
- * - 블로킹 OpenSSL 호출을 별도 std::thread 에서 실행
- * - eventfd 를 Reactor 에 등록하여 완료 시 코루틴 재개
- * - 리액터 스레드 블로킹 없음
+ * 고성능 설계:
+ * - ThreadPool  : OS 스레드를 재사용 (요청마다 thread 생성·파괴 없음)
+ * - ConnPool    : TLS 세션을 호스트별로 재사용 (핸드셰이크 비용 제거)
+ *                 Connection: keep-alive + Content-Length 기반 수신
+ * - shared_ssl_ctx : SSL_CTX 를 프로세스당 1회 생성
+ * - zero-copy body : erase-front + move 로 헤더 제거, 별도 resp_body 할당 없음
  */
 
 #include <qbuem/core/reactor.hpp>
@@ -285,14 +287,22 @@ extract_bearer(std::string_view auth_header) noexcept {
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
+#include <algorithm>
+#include <array>
 #include <charconv>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <format>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <queue>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <sys/eventfd.h>
@@ -308,102 +318,284 @@ struct Response {
     bool        ok() const noexcept { return status >= 200 && status < 300; }
 };
 
-// ── OpenSSL 전역 초기화 (한 번만, 스레드 안전) ───────────────────────────────
-
+// ─────────────────────────────────────────────────────────────────────────────
 namespace detail {
 
-inline void ssl_init() {
-    static std::once_flag flag;
-    std::call_once(flag, []() {
+// ── SSL_CTX 공유 싱글톤 ───────────────────────────────────────────────────────
+// 프로세스당 1회 생성. SSL_CTX는 내부적으로 스레드 안전.
+
+[[nodiscard]] inline SSL_CTX* shared_ssl_ctx() {
+    static SSL_CTX* ctx = []() -> SSL_CTX* {
         SSL_library_init();
         SSL_load_error_strings();
         OpenSSL_add_all_algorithms();
-    });
+        SSL_CTX* c = SSL_CTX_new(TLS_client_method());
+        if (!c) return nullptr;
+        SSL_CTX_set_default_verify_paths(c);
+        SSL_CTX_set_verify(c, SSL_VERIFY_PEER, nullptr);
+        return c;
+    }();
+    return ctx;
 }
 
-// ── 블로킹 HTTPS 요청 (별도 스레드에서 실행) ─────────────────────────────────
+// ── 스레드 풀 ─────────────────────────────────────────────────────────────────
+// 고정 크기 워커 풀. OS 스레드 생성·파괴 비용 제거.
 
-[[nodiscard]] inline Response do_https_blocking(
+class ThreadPool {
+public:
+    explicit ThreadPool(size_t n = std::max(2u, std::thread::hardware_concurrency())) {
+        workers_.reserve(n);
+        for (size_t i = 0; i < n; ++i)
+            workers_.emplace_back([this] { run(); });
+    }
+
+    ~ThreadPool() {
+        { std::lock_guard lock{mu_}; stop_ = true; }
+        cv_.notify_all();
+        for (auto& w : workers_) if (w.joinable()) w.join();
+    }
+
+    template<typename F>
+    void submit(F&& f) {
+        { std::lock_guard lock{mu_}; queue_.emplace(std::forward<F>(f)); }
+        cv_.notify_one();
+    }
+
+    [[nodiscard]] static ThreadPool& global() {
+        static ThreadPool pool;
+        return pool;
+    }
+
+private:
+    void run() {
+        while (true) {
+            std::function<void()> task;
+            {
+                std::unique_lock lock{mu_};
+                cv_.wait(lock, [this] { return stop_ || !queue_.empty(); });
+                if (stop_ && queue_.empty()) return;
+                task = std::move(queue_.front());
+                queue_.pop();
+            }
+            task();
+        }
+    }
+
+    std::vector<std::thread>          workers_;
+    std::queue<std::function<void()>> queue_;
+    std::mutex                        mu_;
+    std::condition_variable           cv_;
+    bool                              stop_ = false;
+};
+
+// ── 커넥션 풀 ─────────────────────────────────────────────────────────────────
+// TLS 세션을 호스트별로 보관·재사용. 유휴 25초 초과 시 자동 폐기.
+// keep-alive 연결은 Content-Length 수신 완료 후 반환.
+
+class ConnPool {
+public:
+    struct Entry {
+        BIO*                                       bio;
+        std::chrono::steady_clock::time_point      last_used;
+    };
+
+    static constexpr std::chrono::seconds kMaxIdle{25}; // 서버 keep-alive보다 짧게
+    static constexpr size_t               kMaxPerHost{4};
+
+    // 사용 가능한 커넥션 반환. 없으면 nullptr.
+    [[nodiscard]] BIO* acquire(std::string_view key) {
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard lock{mu_};
+        auto it = pool_.find(std::string{key});
+        if (it == pool_.end()) return nullptr;
+        auto& vec = it->second;
+        while (!vec.empty()) {
+            Entry e = vec.back();
+            vec.pop_back();
+            if (now - e.last_used < kMaxIdle) return e.bio;
+            BIO_free_all(e.bio);  // 유휴 시간 초과 → 폐기
+        }
+        return nullptr;
+    }
+
+    // 사용 완료된 커넥션 반환. 풀이 가득 찬 경우 폐기.
+    void release(std::string_view key, BIO* bio) {
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard lock{mu_};
+        auto& vec = pool_[std::string{key}];
+        if (vec.size() < kMaxPerHost)
+            vec.push_back({bio, now});
+        else
+            BIO_free_all(bio);
+    }
+
+    [[nodiscard]] static ConnPool& global() {
+        static ConnPool pool;
+        return pool;
+    }
+
+private:
+    std::mutex                                         mu_;
+    std::unordered_map<std::string, std::vector<Entry>> pool_;
+};
+
+// ── 핵심 HTTP 요청 로직 ───────────────────────────────────────────────────────
+// BIO*를 받아 1회 요청 수행.
+// 반환: {Response, reusable}
+//   reusable=true  → Content-Length로 정확히 읽음, 커넥션 재사용 가능
+//   reusable=false → EOF까지 읽음 or 오류, 커넥션 폐기
+// nullopt → 전송 실패 (stale 커넥션 감지 → 재연결 트리거)
+
+[[nodiscard]] inline std::optional<std::pair<Response, bool>>
+do_request(BIO*             bio,
+           std::string_view host,
+           std::string_view method,
+           std::string_view path,
+           std::string_view req_body,
+           std::string_view content_type,
+           std::string_view extra_headers)
+{
+    // ── 요청 전송 ────────────────────────────────────────────────────────────
+    std::string req = std::format("{} {} HTTP/1.1\r\nHost: {}\r\n", method, path, host);
+    if (!req_body.empty()) {
+        if (!content_type.empty())
+            req += std::format("Content-Type: {}\r\n", content_type);
+        req += std::format("Content-Length: {}\r\n", req_body.size());
+    }
+    if (!extra_headers.empty()) req += extra_headers;
+    req += std::format("Connection: keep-alive\r\n\r\n{}", req_body);
+
+    if (BIO_write(bio, req.data(), static_cast<int>(req.size())) <= 0)
+        return std::nullopt;  // 전송 실패 → stale 커넥션
+    BIO_flush(bio);
+
+    // ── 응답 수신 (헤더 끝 \r\n\r\n 까지) ───────────────────────────────────
+    std::string raw;
+    raw.reserve(4096);
+    char buf[4096];
+    size_t sep = std::string::npos;
+    while (sep == std::string::npos) {
+        int n = BIO_read(bio, buf, sizeof(buf));
+        if (n <= 0) return std::nullopt;
+        raw.append(buf, static_cast<size_t>(n));
+        sep = raw.find("\r\n\r\n");
+    }
+
+    // ── 상태 코드 파싱 ────────────────────────────────────────────────────────
+    int status = 0;
+    if (raw.starts_with("HTTP/")) {
+        auto sp = raw.find(' ');
+        if (sp != std::string::npos)
+            std::from_chars(raw.data() + sp + 1, raw.data() + raw.size(), status);
+    }
+
+    // ── Content-Length 파싱 (대소문자 무관) ──────────────────────────────────
+    const std::string_view hdrs{raw.data(), sep};
+    size_t content_length = std::string::npos;  // npos = 알 수 없음
+
+    for (auto hdr : {"Content-Length: ", "content-length: "}) {
+        auto cl = hdrs.find(hdr);
+        if (cl != std::string_view::npos) {
+            cl += std::strlen(hdr);
+            size_t v = 0;
+            std::from_chars(hdrs.data() + cl, hdrs.data() + hdrs.size(), v);
+            content_length = v;
+            break;
+        }
+    }
+
+    // ── 헤더 제거: in-place erase (zero-copy body) ────────────────────────────
+    raw.erase(0, sep + 4);
+
+    if (content_length != std::string::npos) {
+        // Content-Length 있음: 정확히 그 크기만큼 읽고 커넥션 재사용
+        while (raw.size() < content_length) {
+            int n = BIO_read(bio, buf,
+                static_cast<int>(std::min(sizeof(buf), content_length - raw.size())));
+            if (n <= 0) break;
+            raw.append(buf, static_cast<size_t>(n));
+        }
+        return std::pair{Response{status, std::move(raw)}, true};
+    } else {
+        // Content-Length 없음: EOF까지 읽음 (chunked 또는 close)
+        // 커넥션 재사용 불가
+        int n;
+        while ((n = BIO_read(bio, buf, sizeof(buf))) > 0)
+            raw.append(buf, static_cast<size_t>(n));
+        return std::pair{Response{status, std::move(raw)}, false};
+    }
+}
+
+// ── 커넥션 생명주기 관리 ──────────────────────────────────────────────────────
+// 풀에서 재사용 시도 → 실패 시 신규 연결 → 완료 후 풀 반환 or 폐기
+
+[[nodiscard]] inline Response do_https(
     std::string_view host,
     uint16_t         port,
     std::string_view method,
     std::string_view path,
     std::string_view body,
     std::string_view content_type,
-    std::string_view extra_headers = "")
+    std::string_view extra_headers)
 {
-    ssl_init();
+    SSL_CTX* ctx = shared_ssl_ctx();
+    if (!ctx) return {0, "SSL_CTX init failed"};
 
-    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
-    if (!ctx) return {0, "SSL_CTX_new failed"};
-    // 인증서 검증 (시스템 CA 사용)
-    SSL_CTX_set_default_verify_paths(ctx);
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
+    const std::string pool_key = std::format("{}:{}", host, port);
+    auto& pool = ConnPool::global();
 
+    auto manage = [&](BIO* bio) -> bool {
+        auto res = do_request(bio, host, method, path, body, content_type, extra_headers);
+        if (!res) { BIO_free_all(bio); return false; }
+        auto& [resp, reusable] = *res;
+        if (reusable) pool.release(pool_key, bio);
+        else          BIO_free_all(bio);
+        return true;
+    };
+
+    // 1. 풀에서 재사용 시도
+    if (BIO* bio = pool.acquire(pool_key)) {
+        auto res = do_request(bio, host, method, path, body, content_type, extra_headers);
+        if (res) {
+            auto& [resp, reusable] = *res;
+            if (reusable) pool.release(pool_key, bio);
+            else          BIO_free_all(bio);
+            return std::move(resp);
+        }
+        BIO_free_all(bio);  // stale 커넥션 폐기 → 신규 연결로 재시도
+    }
+
+    // 2. 신규 TLS 연결
     const std::string addr = std::format("{}:{}", host, port);
+
     BIO* bio = BIO_new_ssl_connect(ctx);
+    if (!bio) return {0, "BIO_new_ssl_connect failed"};
+
     SSL* ssl = nullptr;
     BIO_get_ssl(bio, &ssl);
+    if (!ssl) { BIO_free_all(bio); return {0, "BIO_get_ssl failed"}; }
+
     SSL_set_mode(ssl, SSL_MODE_AUTO_RETRY);
-    // SNI
-    SSL_set_tlsext_host_name(ssl, std::string(host).c_str());
+    const std::string host_str{host};
+    SSL_set_tlsext_host_name(ssl, host_str.c_str());
     BIO_set_conn_hostname(bio, addr.c_str());
 
     if (BIO_do_connect(bio) <= 0 || BIO_do_handshake(bio) <= 0) {
         BIO_free_all(bio);
-        SSL_CTX_free(ctx);
         return {0, "connect/handshake failed"};
     }
 
-    // HTTP 요청 조합
-    std::string req = std::format(
-        "{} {} HTTP/1.1\r\n"
-        "Host: {}\r\n",
-        method, path, host);
+    auto res = do_request(bio, host, method, path, body, content_type, extra_headers);
+    if (!res) { BIO_free_all(bio); return {0, "request failed"}; }
 
-    if (!content_type.empty())
-        req += std::format("Content-Type: {}\r\n", content_type);
-
-    req += std::format("Content-Length: {}\r\n", body.size());
-
-    if (!extra_headers.empty())
-        req += extra_headers;
-
-    req += std::format("Connection: close\r\n\r\n{}", body);
-
-    BIO_write(bio, req.data(), static_cast<int>(req.size()));
-    BIO_flush(bio);
-
-    // 응답 수신
-    std::string raw;
-    raw.reserve(4096);
-    char buf[4096];
-    int  n;
-    while ((n = BIO_read(bio, buf, sizeof(buf))) > 0)
-        raw.append(buf, static_cast<size_t>(n));
-
-    BIO_free_all(bio);
-    SSL_CTX_free(ctx);
-
-    // 상태 코드 파싱
-    int status = 0;
-    if (raw.starts_with("HTTP/")) {
-        auto sp = raw.find(' ');
-        if (sp != std::string::npos)
-            std::from_chars(raw.data() + sp + 1,
-                            raw.data() + raw.size(), status);
-    }
-
-    // 헤더와 바디 분리
-    auto sep = raw.find("\r\n\r\n");
-    std::string resp_body;
-    if (sep != std::string::npos)
-        resp_body = raw.substr(sep + 4);
-
-    return {status, std::move(resp_body)};
+    auto& [resp, reusable] = *res;
+    if (reusable) pool.release(pool_key, bio);
+    else          BIO_free_all(bio);
+    return std::move(resp);
 }
 
-// URL 파싱 (host, port, path) 공통 헬퍼
+// ── URL 파싱 ─────────────────────────────────────────────────────────────────
+
 struct ParsedUrl {
     std::string host;
     uint16_t    port;
@@ -412,20 +604,18 @@ struct ParsedUrl {
 
 [[nodiscard]] inline ParsedUrl parse_url(std::string_view url) {
     uint16_t port = 443;
-    if (url.starts_with("https://")) url.remove_prefix(8);
+    if (url.starts_with("https://"))      url.remove_prefix(8);
     else if (url.starts_with("http://")) { url.remove_prefix(7); port = 80; }
 
     auto slash = url.find('/');
     std::string host{url.substr(0, slash)};
-    std::string path = (slash != std::string_view::npos) ? std::string{url.substr(slash)} : "/";
+    std::string path = (slash != std::string_view::npos)
+        ? std::string{url.substr(slash)} : "/";
 
-    // 포트 오버라이드
     if (auto colon = host.rfind(':'); colon != std::string::npos) {
-        std::from_chars(host.data() + colon + 1,
-                        host.data() + host.size(), port);
+        std::from_chars(host.data() + colon + 1, host.data() + host.size(), port);
         host.erase(colon);
     }
-
     return {std::move(host), port, std::move(path)};
 }
 
@@ -454,13 +644,17 @@ struct EventFdAwaiter {
 };
 
 // ── 공개 비동기 API ────────────────────────────────────────────────────────────
+// ThreadPool 워커에서 do_https() 실행 → eventfd로 완료 신호.
+// 파라미터: host/path는 parse_url()이 std::string으로 소유,
+//           body/content_type/extra_headers는 std::string으로 복사
+//           (string_view 파라미터가 co_await 중에 댕글링될 수 있으므로).
 
 /**
- * @brief URL 파싱 후 비동기 HTTPS POST 요청
+ * @brief 비동기 HTTPS POST 요청
  * @param url          전체 URL (https://host/path?query)
  * @param body         요청 바디
  * @param content_type Content-Type 헤더 값
- * @param extra_headers 추가 헤더 문자열 (각 줄 \r\n 으로 끝나야 함, 예: "Authorization: Bearer token\r\n")
+ * @param extra_headers 추가 헤더 문자열 (각 줄 \r\n 으로 끝나야 함)
  */
 [[nodiscard]] inline qbuem::Task<Response>
 post(std::string_view url, std::string_view body,
@@ -473,20 +667,24 @@ post(std::string_view url, std::string_view body,
     if (efd < 0) co_return Response{0, "eventfd creation failed"};
 
     auto result = std::make_shared<Response>();
-    std::string host_copy{host}, path_copy{path};
-    std::string body_copy{body}, ct_copy{content_type};
-    std::string hdrs_copy{extra_headers};
-
-    std::thread([=, result]() mutable {
-        *result = detail::do_https_blocking(host_copy, port, "POST",
-                                            path_copy, body_copy, ct_copy, hdrs_copy);
+    detail::ThreadPool::global().submit([
+        result,
+        efd,
+        host   = std::move(host),
+        port,
+        path   = std::move(path),
+        body   = std::string{body},
+        ct     = std::string{content_type},
+        hdrs   = std::string{extra_headers}
+    ]() mutable {
+        *result = detail::do_https(host, port, "POST", path, body, ct, hdrs);
         uint64_t one = 1;
         ::write(efd, &one, sizeof(one));
-    }).detach();
+    });
 
     co_await EventFdAwaiter{efd};
     ::close(efd);
-    co_return *result;
+    co_return std::move(*result);
 }
 
 /**
@@ -503,17 +701,22 @@ get(std::string_view url, std::string_view extra_headers = "")
     if (efd < 0) co_return Response{0, "eventfd creation failed"};
 
     auto result = std::make_shared<Response>();
-    std::string h{host}, p{path}, hdrs{extra_headers};
-
-    std::thread([=, result]() mutable {
-        *result = detail::do_https_blocking(h, port, "GET", p, "", "", hdrs);
+    detail::ThreadPool::global().submit([
+        result,
+        efd,
+        host = std::move(host),
+        port,
+        path = std::move(path),
+        hdrs = std::string{extra_headers}
+    ]() mutable {
+        *result = detail::do_https(host, port, "GET", path, "", "", hdrs);
         uint64_t one = 1;
         ::write(efd, &one, sizeof(one));
-    }).detach();
+    });
 
     co_await EventFdAwaiter{efd};
     ::close(efd);
-    co_return *result;
+    co_return std::move(*result);
 }
 
 } // namespace qbuem_routine::https
@@ -552,6 +755,7 @@ get(std::string_view url, std::string_view extra_headers = "")
 #include <qbuem/crypto.hpp>
 #include <qbuem/url.hpp>          // qbuem::url_encode / url_decode
 
+#include <array>
 #include <chrono>
 #include <format>
 #include <mutex>
@@ -565,7 +769,7 @@ namespace qbuem_routine::oauth {
 // ── 사용자 정보 (프로바이더 공통) ────────────────────────────────────────────
 
 struct UserInfo {
-    std::string provider;     ///< google | naver | kakao
+    std::string provider;     ///< google | github | discord | microsoft | facebook | naver | kakao
     std::string provider_id;  ///< 프로바이더 내 고유 ID
     std::string email;
     std::string name;
@@ -594,46 +798,86 @@ parse_query(std::string_view qs) {
     return m;
 }
 
-// JSON에서 필드 값 추출 — 문자열("key":"val")과 스칼라("key":123) 모두 지원
+// Zero-copy fast-path: 이스케이프 시퀀스 없는 문자열 필드를 string_view로 반환.
+// 이스케이프 포함이거나 필드가 없으면 빈 뷰 반환 (json_get_field로 fallback).
+// 반환 뷰의 수명은 json 파라미터와 동일.
+[[nodiscard]] inline std::string_view json_get_field_view(std::string_view json,
+                                                           std::string_view key) {
+    auto k = std::format(R"("{}":")", key);
+    auto pos = json.find(k);
+    if (pos == std::string_view::npos) return {};
+    pos += k.size();
+    auto start = pos;
+    while (pos < json.size() && json[pos] != '"' && json[pos] != '\\')
+        ++pos;
+    if (pos >= json.size() || json[pos] == '\\') return {};  // 이스케이프 or 미종료
+    return json.substr(start, pos - start);
+}
+
+// JSON에서 문자열 필드 추출 ("key":"val") — JSON 이스케이프 시퀀스 완전 처리
+// 스칼라 필드 ("key":123/true/null)도 지원
 [[nodiscard]] inline std::string json_get_field(std::string_view json,
                                                  std::string_view key) {
-    // 문자열 형식 "key":"value" 먼저 시도
+    // ── 문자열 형식: "key":"value" ──────────────────────────────────────────
+    // Fast path: 이스케이프 없는 경우 zero-copy view → string 변환
+    if (auto v = json_get_field_view(json, key); !v.empty())
+        return std::string{v};
+
     auto k_str = std::format(R"("{}":")", key);
     auto pos   = json.find(k_str);
     if (pos != std::string_view::npos) {
         pos += k_str.size();
-        auto end = pos;
-        while (end < json.size() && json[end] != '"') {
-            if (json[end] == '\\') ++end;  // 이스케이프 문자 건너뜀
-            ++end;
+        std::string out;
+        while (pos < json.size() && json[pos] != '"') {
+            if (json[pos] == '\\' && pos + 1 < json.size()) {
+                ++pos;  // 백슬래시 건너뜀
+                switch (json[pos]) {
+                    case '"':  out += '"';  break;
+                    case '\\': out += '\\'; break;
+                    case '/':  out += '/';  break;
+                    case 'n':  out += '\n'; break;
+                    case 'r':  out += '\r'; break;
+                    case 't':  out += '\t'; break;
+                    case 'b':  out += '\b'; break;
+                    case 'f':  out += '\f'; break;
+                    default:   out += json[pos]; break;  // \uXXXX 등은 근사 처리
+                }
+            } else {
+                out += json[pos];
+            }
+            ++pos;
         }
-        return std::string{json.substr(pos, end - pos)};
+        return out;
     }
-    // 스칼라 형식 "key":value (숫자, boolean, null)
+
+    // ── 스칼라 형식: "key":value (숫자, boolean, null) ─────────────────────
     auto k_int = std::format(R"("{}":)", key);
     pos = json.find(k_int);
     if (pos != std::string_view::npos) {
         pos += k_int.size();
-        while (pos < json.size() && json[pos] == ' ') ++pos;  // 공백 건너뜀
+        while (pos < json.size() && json[pos] == ' ') ++pos;  // 선행 공백 제거
         auto end = pos;
         while (end < json.size() && json[end] != ',' &&
                json[end] != '}' && json[end] != ']') {
             ++end;
         }
+        // 후행 공백 제거
+        while (end > pos && json[end - 1] == ' ') --end;
         auto val = json.substr(pos, end - pos);
-        if (val == "null") return {};  // JSON null → 빈 문자열
+        if (val == "null") return {};
         return std::string{val};
     }
     return {};
 }
 
 // 중첩 JSON 객체 내부 추출 ("key":{ ... })
-// 반환값: { 이후 내용 (닫는 괄호 포함 안 함)
+// 반환: { 다음 위치부터의 string_view. key가 없으면 빈 string_view 반환.
+// ※ fallback으로 전체 json을 반환하지 않음 — 잘못된 필드 매칭 방지
 [[nodiscard]] inline std::string_view json_get_obj(std::string_view json,
                                                     std::string_view key) {
     auto k = std::format(R"("{}":{{)", key);
     auto pos = json.find(k);
-    if (pos == std::string_view::npos) return json;  // fallback
+    if (pos == std::string_view::npos) return {};  // key 없으면 빈 뷰 반환
     return json.substr(pos + k.size());
 }
 
@@ -648,33 +892,53 @@ inline std::string redirect_base() {
 
 } // namespace detail
 
-// ── CSRF state 관리 (인메모리, TTL 10분, 스레드 안전) ────────────────────────
+// ── CSRF state 관리 (인메모리, TTL 10분, 샤딩된 스레드 안전) ───────────────────
 // 모든 프로바이더가 공유하므로 프로바이더 선언보다 먼저 위치해야 합니다.
+// 단일 글로벌 mutex 대신 kShards개의 독립 mutex로 경합 분산.
 
 namespace state_store {
 
 struct Entry { int64_t exp; };
-inline std::unordered_map<std::string, Entry> g_states;
-inline std::mutex g_mutex;
 
-// 만료된 엔트리 정리 (내부용, mutex 보유 상태에서 호출)
-inline void purge_expired_locked(int64_t now) {
-    for (auto it = g_states.begin(); it != g_states.end(); ) {
-        if (it->second.exp < now) it = g_states.erase(it);
+namespace detail_ss {
+
+inline constexpr size_t kShards = 16;
+
+struct Shard {
+    std::mutex                              mutex;
+    std::unordered_map<std::string, Entry>  states;
+};
+
+// 샤드 배열은 inline variable로 ODR-safe 전역 공유
+inline std::array<Shard, kShards> g_shards;
+
+[[nodiscard]] inline Shard& shard_for(std::string_view key) {
+    // FNV-1a 기반 빠른 해시 (std::hash<string_view>는 구현 의존적이라 직접 사용)
+    size_t h = 14695981039346656037ull;
+    for (unsigned char c : key) h = (h ^ c) * 1099511628211ull;
+    return g_shards[h % kShards];
+}
+
+inline void purge_expired_locked(Shard& shard, int64_t now) {
+    for (auto it = shard.states.begin(); it != shard.states.end(); ) {
+        if (it->second.exp < now) it = shard.states.erase(it);
         else ++it;
     }
 }
 
-/// CSRF 토큰 발급 (TTL 10분). issue() 호출 시 만료 토큰 자동 정리.
+} // namespace detail_ss
+
+/// CSRF 토큰 발급 (TTL 10분). 해당 샤드의 만료 토큰 자동 정리.
 inline std::string issue() {
     using namespace std::chrono;
     const int64_t now = duration_cast<seconds>(
         system_clock::now().time_since_epoch()).count();
     auto state = qbuem::crypto::csrf_token(128);
 
-    std::lock_guard lock{g_mutex};
-    purge_expired_locked(now);
-    g_states[state] = {now + 600};
+    auto& shard = detail_ss::shard_for(state);
+    std::lock_guard lock{shard.mutex};
+    detail_ss::purge_expired_locked(shard, now);
+    shard.states[state] = {now + 600};
     return state;
 }
 
@@ -684,11 +948,12 @@ inline bool verify_and_consume(std::string_view state) {
     const int64_t now = duration_cast<seconds>(
         system_clock::now().time_since_epoch()).count();
 
-    std::lock_guard lock{g_mutex};
-    auto it = g_states.find(std::string{state});
-    if (it == g_states.end()) return false;
+    auto& shard = detail_ss::shard_for(state);
+    std::lock_guard lock{shard.mutex};
+    auto it = shard.states.find(std::string{state});
+    if (it == shard.states.end()) return false;
     bool valid = (it->second.exp >= now);
-    g_states.erase(it);
+    shard.states.erase(it);
     return valid;
 }
 
@@ -706,13 +971,11 @@ struct GoogleProvider {
             "https://accounts.google.com/o/oauth2/v2/auth"
             "?client_id={}&redirect_uri={}&response_type=code"
             "&scope=openid+email+profile&state={}",
-            detail::env_or("GOOGLE_CLIENT_ID"),
+            qbuem::url_encode(detail::env_or("GOOGLE_CLIENT_ID")),
             qbuem::url_encode(detail::redirect_base() + "/auth/google/callback"),
-            state);
+            qbuem::url_encode(state));
     }
 
-    /// @param code  콜백으로 수신한 인가 코드
-    /// @param state 콜백으로 수신한 state (CSRF 검증용)
     [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
     exchange(std::string_view code, std::string_view state) {
         if (!state_store::verify_and_consume(state)) co_return std::nullopt;
@@ -733,7 +996,7 @@ struct GoogleProvider {
         const auto access_token = detail::json_get_field(token_resp.body, "access_token");
         if (access_token.empty()) co_return std::nullopt;
 
-        // 2. 사용자 정보 — Authorization: Bearer 헤더로 전달 (URL 노출 방지)
+        // 2. 사용자 정보
         const std::string auth_header =
             std::format("Authorization: Bearer {}\r\n", access_token);
         auto info_resp = co_await https::get(
@@ -742,7 +1005,7 @@ struct GoogleProvider {
 
         const auto& j = info_resp.body;
         co_return UserInfo{
-            .provider    = "google",
+            .provider    = std::string{kName},
             .provider_id = detail::json_get_field(j, "sub"),
             .email       = detail::json_get_field(j, "email"),
             .name        = detail::json_get_field(j, "name"),
@@ -762,13 +1025,11 @@ struct NaverProvider {
         return std::format(
             "https://nid.naver.com/oauth2.0/authorize"
             "?client_id={}&redirect_uri={}&response_type=code&state={}",
-            detail::env_or("NAVER_CLIENT_ID"),
+            qbuem::url_encode(detail::env_or("NAVER_CLIENT_ID")),
             qbuem::url_encode(detail::redirect_base() + "/auth/naver/callback"),
-            state);
+            qbuem::url_encode(state));
     }
 
-    /// @param code  콜백으로 수신한 인가 코드
-    /// @param state 콜백으로 수신한 state (CSRF 검증 + Naver 토큰 요청용)
     [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
     exchange(std::string_view code, std::string_view state) {
         if (!state_store::verify_and_consume(state)) co_return std::nullopt;
@@ -789,7 +1050,7 @@ struct NaverProvider {
         const auto access_token = detail::json_get_field(token_resp.body, "access_token");
         if (access_token.empty()) co_return std::nullopt;
 
-        // 2. 사용자 정보 — Authorization: Bearer 헤더로 전달 (URL 노출 방지)
+        // 2. 사용자 정보
         const std::string auth_header =
             std::format("Authorization: Bearer {}\r\n", access_token);
         auto info_raw = co_await https::get(
@@ -798,14 +1059,11 @@ struct NaverProvider {
 
         // Naver 응답: {"resultcode":"00","message":"success","response":{...}}
         const auto& j = info_raw.body;
-        constexpr std::string_view kRespKey = R"("response":{)";
-        auto resp_start = j.find(kRespKey);
-        std::string_view resp_json = (resp_start != std::string::npos)
-            ? std::string_view{j}.substr(resp_start + kRespKey.size())
-            : std::string_view{j};
+        const auto resp_json = detail::json_get_obj(j, "response");
+        if (resp_json.empty()) co_return std::nullopt;
 
         co_return UserInfo{
-            .provider    = "naver",
+            .provider    = std::string{kName},
             .provider_id = detail::json_get_field(resp_json, "id"),
             .email       = detail::json_get_field(resp_json, "email"),
             .name        = detail::json_get_field(resp_json, "name"),
@@ -825,13 +1083,11 @@ struct KakaoProvider {
         return std::format(
             "https://kauth.kakao.com/oauth/authorize"
             "?client_id={}&redirect_uri={}&response_type=code&state={}",
-            detail::env_or("KAKAO_CLIENT_ID"),
+            qbuem::url_encode(detail::env_or("KAKAO_CLIENT_ID")),
             qbuem::url_encode(detail::redirect_base() + "/auth/kakao/callback"),
-            state);
+            qbuem::url_encode(state));
     }
 
-    /// @param code  콜백으로 수신한 인가 코드
-    /// @param state 콜백으로 수신한 state (CSRF 검증용)
     [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
     exchange(std::string_view code, std::string_view state) {
         if (!state_store::verify_and_consume(state)) co_return std::nullopt;
@@ -850,7 +1106,7 @@ struct KakaoProvider {
         const auto access_token = detail::json_get_field(token_resp.body, "access_token");
         if (access_token.empty()) co_return std::nullopt;
 
-        // 2. 사용자 정보 — Authorization: Bearer 헤더로 전달 (URL 노출 방지)
+        // 2. 사용자 정보
         const std::string auth_header =
             std::format("Authorization: Bearer {}\r\n", access_token);
         auto info_resp = co_await https::get(
@@ -865,11 +1121,13 @@ struct KakaoProvider {
         const auto id = detail::json_get_field(j, "id");
 
         // 중첩 객체 접근: kakao_account → profile
+        // kakao_account 누락은 비정상 응답 — nullopt 반환
         auto acc_json  = detail::json_get_obj(j, "kakao_account");
+        if (acc_json.empty()) co_return std::nullopt;
         auto prof_json = detail::json_get_obj(acc_json, "profile");
 
         co_return UserInfo{
-            .provider    = "kakao",
+            .provider    = std::string{kName},
             .provider_id = id,
             .email       = detail::json_get_field(acc_json, "email"),
             .name        = detail::json_get_field(prof_json, "nickname"),
@@ -889,13 +1147,11 @@ struct GitHubProvider {
         return std::format(
             "https://github.com/login/oauth/authorize"
             "?client_id={}&redirect_uri={}&scope=read:user+user:email&state={}",
-            detail::env_or("GITHUB_CLIENT_ID"),
+            qbuem::url_encode(detail::env_or("GITHUB_CLIENT_ID")),
             qbuem::url_encode(detail::redirect_base() + "/auth/github/callback"),
-            state);
+            qbuem::url_encode(state));
     }
 
-    /// @param code  콜백으로 수신한 인가 코드
-    /// @param state 콜백으로 수신한 state (CSRF 검증용)
     [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
     exchange(std::string_view code, std::string_view state) {
         if (!state_store::verify_and_consume(state)) co_return std::nullopt;
@@ -951,7 +1207,7 @@ struct GitHubProvider {
         }
 
         co_return UserInfo{
-            .provider    = "github",
+            .provider    = std::string{kName},
             .provider_id = detail::json_get_field(j, "id"),
             .email       = email,
             .name        = detail::json_get_field(j, "name"),
@@ -972,13 +1228,11 @@ struct DiscordProvider {
             "https://discord.com/api/oauth2/authorize"
             "?client_id={}&redirect_uri={}&response_type=code"
             "&scope=identify+email&state={}",
-            detail::env_or("DISCORD_CLIENT_ID"),
+            qbuem::url_encode(detail::env_or("DISCORD_CLIENT_ID")),
             qbuem::url_encode(detail::redirect_base() + "/auth/discord/callback"),
-            state);
+            qbuem::url_encode(state));
     }
 
-    /// @param code  콜백으로 수신한 인가 코드
-    /// @param state 콜백으로 수신한 state (CSRF 검증용)
     [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
     exchange(std::string_view code, std::string_view state) {
         if (!state_store::verify_and_consume(state)) co_return std::nullopt;
@@ -1022,7 +1276,7 @@ struct DiscordProvider {
             name = detail::json_get_field(j, "username");
 
         co_return UserInfo{
-            .provider    = "discord",
+            .provider    = std::string{kName},
             .provider_id = id,
             .email       = detail::json_get_field(j, "email"),
             .name        = name,
@@ -1045,13 +1299,11 @@ struct MicrosoftProvider {
             "?client_id={}&redirect_uri={}&response_type=code"
             "&scope=openid+email+profile+User.Read&state={}",
             tenant,
-            detail::env_or("MICROSOFT_CLIENT_ID"),
+            qbuem::url_encode(detail::env_or("MICROSOFT_CLIENT_ID")),
             qbuem::url_encode(detail::redirect_base() + "/auth/microsoft/callback"),
-            state);
+            qbuem::url_encode(state));
     }
 
-    /// @param code  콜백으로 수신한 인가 코드
-    /// @param state 콜백으로 수신한 state (CSRF 검증용)
     [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
     exchange(std::string_view code, std::string_view state) {
         if (!state_store::verify_and_consume(state)) co_return std::nullopt;
@@ -1088,12 +1340,20 @@ struct MicrosoftProvider {
         if (email.empty())
             email = detail::json_get_field(j, "userPrincipalName");
 
+        // Graph API 프로필 사진은 /me/photo/$value 에서 바이너리로 반환됨.
+        // 공개 URL이 없으므로 엔드포인트 경로를 저장하여 호출자가 Bearer 토큰으로 직접 요청하도록 함.
+        const auto photo_meta_resp = co_await https::get(
+            "https://graph.microsoft.com/v1.0/me/photo", auth_header);
+        const std::string avatar_url = photo_meta_resp.ok()
+            ? "https://graph.microsoft.com/v1.0/me/photo/$value"
+            : std::string{};
+
         co_return UserInfo{
-            .provider    = "microsoft",
+            .provider    = std::string{kName},
             .provider_id = detail::json_get_field(j, "id"),
             .email       = email,
             .name        = detail::json_get_field(j, "displayName"),
-            .avatar_url  = {},  // Graph API 프로필 사진은 별도 /me/photo/$value 엔드포인트
+            .avatar_url  = avatar_url,
         };
     }
 };
@@ -1109,27 +1369,26 @@ struct FacebookProvider {
         return std::format(
             "https://www.facebook.com/v20.0/dialog/oauth"
             "?client_id={}&redirect_uri={}&scope=email,public_profile&state={}",
-            detail::env_or("FACEBOOK_CLIENT_ID"),
+            qbuem::url_encode(detail::env_or("FACEBOOK_CLIENT_ID")),
             qbuem::url_encode(detail::redirect_base() + "/auth/facebook/callback"),
-            state);
+            qbuem::url_encode(state));
     }
 
-    /// @param code  콜백으로 수신한 인가 코드
-    /// @param state 콜백으로 수신한 state (CSRF 검증용)
     [[nodiscard]] static qbuem::Task<std::optional<UserInfo>>
     exchange(std::string_view code, std::string_view state) {
         if (!state_store::verify_and_consume(state)) co_return std::nullopt;
 
-        // 1. 코드 → 액세스 토큰 (Facebook은 GET 방식 사용)
-        const auto token_url = std::format(
-            "https://graph.facebook.com/v20.0/oauth/access_token"
-            "?client_id={}&client_secret={}&code={}&redirect_uri={}",
+        // 1. 코드 → 액세스 토큰 (POST 사용: client_secret을 URL이 아닌 바디에 포함)
+        // GET으로 처리하면 client_secret이 URL에 노출되어 서버 로그 등에 기록됨
+        const std::string token_body = std::format(
+            "client_id={}&client_secret={}&code={}&redirect_uri={}",
             qbuem::url_encode(detail::env_or("FACEBOOK_CLIENT_ID")),
             qbuem::url_encode(detail::env_or("FACEBOOK_CLIENT_SECRET")),
             qbuem::url_encode(code),
             qbuem::url_encode(detail::redirect_base() + "/auth/facebook/callback"));
 
-        auto token_resp = co_await https::get(token_url);
+        auto token_resp = co_await https::post(
+            "https://graph.facebook.com/v20.0/oauth/access_token", token_body);
         if (!token_resp.ok()) co_return std::nullopt;
 
         const auto access_token = detail::json_get_field(token_resp.body, "access_token");
@@ -1145,13 +1404,14 @@ struct FacebookProvider {
         if (!info_resp.ok()) co_return std::nullopt;
 
         // 프로필 사진 중첩 구조: {"picture":{"data":{"url":"..."}}}
+        // json_get_obj는 key 없으면 빈 뷰를 반환하므로 안전
         const auto& j = info_resp.body;
-        auto pic_data    = detail::json_get_obj(j, "picture");
-        auto pic_inner   = detail::json_get_obj(pic_data, "data");
-        auto avatar_url  = detail::json_get_field(pic_inner, "url");
+        auto pic_data   = detail::json_get_obj(j, "picture");
+        auto pic_inner  = detail::json_get_obj(pic_data, "data");
+        auto avatar_url = detail::json_get_field(pic_inner, "url");
 
         co_return UserInfo{
-            .provider    = "facebook",
+            .provider    = std::string{kName},
             .provider_id = detail::json_get_field(j, "id"),
             .email       = detail::json_get_field(j, "email"),
             .name        = detail::json_get_field(j, "name"),
