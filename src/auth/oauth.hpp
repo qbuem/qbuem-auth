@@ -206,7 +206,7 @@ inline std::string issue() {
     using namespace std::chrono;
     const int64_t now = duration_cast<seconds>(
         system_clock::now().time_since_epoch()).count();
-    auto state = qbuem::crypto::csrf_token(128);
+    auto state = qbuem::csrf_token(128);
 
     auto& shard = detail_ss::shard_for(state);
     std::lock_guard lock{shard.mutex};

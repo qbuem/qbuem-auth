@@ -37,7 +37,10 @@
 #include <unordered_map>
 #include <vector>
 
-#include <sys/eventfd.h>
+#ifdef __linux__
+#  include <sys/eventfd.h>
+#endif
+#include <fcntl.h>
 #include <unistd.h>
 
 namespace qbuem_routine::https {
@@ -396,25 +399,82 @@ struct ParsedUrl {
 
 } // namespace detail
 
-// ── eventfd Awaiter ───────────────────────────────────────────────────────────
+// ── Platform-portable notification fd ────────────────────────────────────────
+// Linux: eventfd (single fd, 8-byte counter)
+// macOS: pipe pair (read_fd, write_fd)
+
+namespace detail {
+
+struct NotifyFd {
+    int read_fd  = -1;  ///< Fd to register for EVFILT_READ / epoll read
+    int write_fd = -1;  ///< Fd to write signal to (same as read_fd on Linux)
+
+    static NotifyFd create() noexcept {
+        NotifyFd n;
+#ifdef __linux__
+        n.read_fd = n.write_fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+#else
+        int fds[2];
+        if (::pipe(fds) == 0) {
+            ::fcntl(fds[0], F_SETFL, O_NONBLOCK | O_CLOEXEC);
+            ::fcntl(fds[1], F_SETFL, O_NONBLOCK | O_CLOEXEC);
+            n.read_fd  = fds[0];
+            n.write_fd = fds[1];
+        }
+#endif
+        return n;
+    }
+
+    bool valid() const noexcept { return read_fd >= 0; }
+
+    void signal() const noexcept {
+#ifdef __linux__
+        uint64_t one = 1;
+        ::write(write_fd, &one, sizeof(one));
+#else
+        char one = 1;
+        ::write(write_fd, &one, sizeof(one));
+#endif
+    }
+
+    void consume() const noexcept {
+#ifdef __linux__
+        uint64_t val = 0;
+        ::read(read_fd, &val, sizeof(val));
+#else
+        char val = 0;
+        ::read(read_fd, &val, sizeof(val));
+#endif
+    }
+
+    void close_all() const noexcept {
+        if (read_fd >= 0) ::close(read_fd);
+#ifndef __linux__
+        if (write_fd >= 0 && write_fd != read_fd) ::close(write_fd);
+#endif
+    }
+};
+
+} // namespace detail
+
+// ── Notify Awaiter ────────────────────────────────────────────────────────────
 
 struct EventFdAwaiter {
-    int efd;
+    detail::NotifyFd nfd;
 
     bool await_ready() const noexcept { return false; }
 
     void await_suspend(std::coroutine_handle<> h) noexcept {
         auto* reactor = qbuem::Reactor::current();
-        reactor->register_event(efd, qbuem::EventType::Read,
+        reactor->register_event(nfd.read_fd, qbuem::EventType::Read,
             [this, h, reactor](int) mutable {
-                reactor->unregister_event(efd, qbuem::EventType::Read);
+                reactor->unregister_event(nfd.read_fd, qbuem::EventType::Read);
                 reactor->post([h]() mutable { h.resume(); });
             });
     }
 
     void await_resume() noexcept {
-        uint64_t val = 0;
-        ::read(efd, &val, sizeof(val));
+        nfd.consume();
     }
 };
 
@@ -438,13 +498,13 @@ post(std::string_view url, std::string_view body,
 {
     auto [host, port, path] = detail::parse_url(url);
 
-    int efd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if (efd < 0) co_return Response{0, "eventfd creation failed"};
+    auto nfd = detail::NotifyFd::create();
+    if (!nfd.valid()) co_return Response{0, "notify fd creation failed"};
 
     auto result = std::make_shared<Response>();
     detail::ThreadPool::global().submit([
         result,
-        efd,
+        nfd,
         host   = std::move(host),
         port,
         path   = std::move(path),
@@ -453,12 +513,11 @@ post(std::string_view url, std::string_view body,
         hdrs   = std::string{extra_headers}
     ]() mutable {
         *result = detail::do_https(host, port, "POST", path, body, ct, hdrs);
-        uint64_t one = 1;
-        ::write(efd, &one, sizeof(one));
+        nfd.signal();
     });
 
-    co_await EventFdAwaiter{efd};
-    ::close(efd);
+    co_await EventFdAwaiter{nfd};
+    nfd.close_all();
     co_return std::move(*result);
 }
 
@@ -472,25 +531,24 @@ get(std::string_view url, std::string_view extra_headers = "")
 {
     auto [host, port, path] = detail::parse_url(url);
 
-    int efd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if (efd < 0) co_return Response{0, "eventfd creation failed"};
+    auto nfd = detail::NotifyFd::create();
+    if (!nfd.valid()) co_return Response{0, "notify fd creation failed"};
 
     auto result = std::make_shared<Response>();
     detail::ThreadPool::global().submit([
         result,
-        efd,
+        nfd,
         host = std::move(host),
         port,
         path = std::move(path),
         hdrs = std::string{extra_headers}
     ]() mutable {
         *result = detail::do_https(host, port, "GET", path, "", "", hdrs);
-        uint64_t one = 1;
-        ::write(efd, &one, sizeof(one));
+        nfd.signal();
     });
 
-    co_await EventFdAwaiter{efd};
-    ::close(efd);
+    co_await EventFdAwaiter{nfd};
+    nfd.close_all();
     co_return std::move(*result);
 }
 

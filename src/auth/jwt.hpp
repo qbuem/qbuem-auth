@@ -65,7 +65,9 @@ struct Claims {
             std::memcpy(k.data(), env, len);
             return k;
         }
-        return qbuem::crypto::random_bytes<32>();
+        auto r = qbuem::crypto::random_bytes<32>();
+        if (!r) return {};   // fallback: zero key (should not happen)
+        return *r;
     }();
     return std::span<const uint8_t>{key.data(), key.size()};
 }
@@ -239,7 +241,7 @@ decode(std::string_view token, TokenType expect_type = TokenType::Access) {
         std::string(header_b64) + "." + std::string(payload_b64);
     const auto expected_sig = detail::sign(signing_input);
 
-    if (!qbuem::crypto::constant_time_equal(expected_sig, sig_b64))
+    if (!qbuem::constant_time_equal(expected_sig, sig_b64))
         return std::nullopt;
 
     // Payload 복원

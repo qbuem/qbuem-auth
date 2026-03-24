@@ -8,17 +8,19 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 include(FetchContent)
 
 # ── qbuem-stack ───────────────────────────────────────────────────────────────
-set(QBUEM_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
-set(QBUEM_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(QBUEM_BUILD_BENCH    OFF CACHE BOOL "" FORCE)
-set(QBUEM_INSTALL        OFF CACHE BOOL "" FORCE)
+if(NOT TARGET qbuem-stack::crypto)
+    set(QBUEM_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+    set(QBUEM_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(QBUEM_BUILD_BENCH    OFF CACHE BOOL "" FORCE)
+    set(QBUEM_INSTALL        OFF CACHE BOOL "" FORCE)
 
-FetchContent_Declare(
-    qbuem_stack
-    GIT_REPOSITORY https://github.com/qbuem/qbuem-stack.git
-    GIT_TAG        main
-)
-FetchContent_MakeAvailable(qbuem_stack)
+    FetchContent_Declare(
+        qbuem_stack
+        GIT_REPOSITORY https://github.com/qbuem/qbuem-stack.git
+        GIT_TAG        main
+    )
+    FetchContent_MakeAvailable(qbuem_stack)
+endif()
 
 # ── OpenSSL (OAuth HTTPS + TLS) ───────────────────────────────────────────────
 find_package(OpenSSL REQUIRED)
