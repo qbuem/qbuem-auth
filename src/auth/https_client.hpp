@@ -326,7 +326,7 @@ do_request(BIO*             bio,
     std::string_view extra_headers)
 {
     SSL_CTX* ctx = shared_ssl_ctx();
-    if (!ctx) return {0, "SSL_CTX init failed"};
+    if (!ctx) return {0, "SSL_CTX init failed", {}};
 
     const std::string pool_key = std::format("{}:{}", host, port);
     auto& pool = ConnPool::global();
@@ -352,11 +352,11 @@ do_request(BIO*             bio,
 
     // 2. 신규 TLS 연결
     BIO* bio = BIO_new_ssl_connect(ctx);
-    if (!bio) return {0, "BIO_new_ssl_connect failed"};
+    if (!bio) return {0, "BIO_new_ssl_connect failed", {}};
 
     SSL* ssl = nullptr;
     BIO_get_ssl(bio, &ssl);
-    if (!ssl) { BIO_free_all(bio); return {0, "BIO_get_ssl failed"}; }
+    if (!ssl) { BIO_free_all(bio); return {0, "BIO_get_ssl failed", {}}; }
 
     SSL_set_mode(ssl, SSL_MODE_AUTO_RETRY);
     const std::string host_str{host};
@@ -365,11 +365,11 @@ do_request(BIO*             bio,
 
     if (BIO_do_connect(bio) <= 0 || BIO_do_handshake(bio) <= 0) {
         BIO_free_all(bio);
-        return {0, "connect/handshake failed"};
+        return {0, "connect/handshake failed", {}};
     }
 
     if (auto resp = try_conn(bio)) return std::move(*resp);
-    return {0, "request failed"};
+    return {0, "request failed", {}};
 }
 
 // ── URL 파싱 ─────────────────────────────────────────────────────────────────
@@ -430,20 +430,20 @@ struct NotifyFd {
     void signal() const noexcept {
 #ifdef __linux__
         uint64_t one = 1;
-        ::write(write_fd, &one, sizeof(one));
+        [[maybe_unused]] auto _ = ::write(write_fd, &one, sizeof(one));
 #else
         char one = 1;
-        ::write(write_fd, &one, sizeof(one));
+        [[maybe_unused]] auto _ = ::write(write_fd, &one, sizeof(one));
 #endif
     }
 
     void consume() const noexcept {
 #ifdef __linux__
         uint64_t val = 0;
-        ::read(read_fd, &val, sizeof(val));
+        [[maybe_unused]] auto _ = ::read(read_fd, &val, sizeof(val));
 #else
         char val = 0;
-        ::read(read_fd, &val, sizeof(val));
+        [[maybe_unused]] auto _ = ::read(read_fd, &val, sizeof(val));
 #endif
     }
 
@@ -499,7 +499,7 @@ post(std::string_view url, std::string_view body,
     auto [host, port, path] = detail::parse_url(url);
 
     auto nfd = detail::NotifyFd::create();
-    if (!nfd.valid()) co_return Response{0, "notify fd creation failed"};
+    if (!nfd.valid()) co_return Response{0, "notify fd creation failed", {}};
 
     auto result = std::make_shared<Response>();
     detail::ThreadPool::global().submit([
@@ -532,7 +532,7 @@ get(std::string_view url, std::string_view extra_headers = "")
     auto [host, port, path] = detail::parse_url(url);
 
     auto nfd = detail::NotifyFd::create();
-    if (!nfd.valid()) co_return Response{0, "notify fd creation failed"};
+    if (!nfd.valid()) co_return Response{0, "notify fd creation failed", {}};
 
     auto result = std::make_shared<Response>();
     detail::ThreadPool::global().submit([
