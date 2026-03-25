@@ -2,15 +2,15 @@
 
 /**
  * @file auth/oauth.hpp
- * @brief OAuth2 프로바이더 통합
+ * @brief OAuth2 provider integration
  *        — Google / GitHub / Discord / Microsoft / Facebook / Naver / Kakao
  *
- * 흐름:
+ * Flow:
  *   1. GET /auth/{provider}/login  → 302 redirect to provider
  *   2. GET /auth/{provider}/callback?code=...&state=...
- *         → state CSRF 검증 → 코드 교환 → 사용자 정보 조회 → JWT 발급
+ *         → state CSRF verification → code exchange → user info fetch → JWT issuance
  *
- * 환경변수 설정:
+ * Environment variable configuration:
  *   GOOGLE_CLIENT_ID,    GOOGLE_CLIENT_SECRET
  *   GITHUB_CLIENT_ID,    GITHUB_CLIENT_SECRET
  *   DISCORD_CLIENT_ID,   DISCORD_CLIENT_SECRET
@@ -18,7 +18,7 @@
  *   FACEBOOK_CLIENT_ID,  FACEBOOK_CLIENT_SECRET
  *   NAVER_CLIENT_ID,     NAVER_CLIENT_SECRET
  *   KAKAO_CLIENT_ID,     KAKAO_CLIENT_SECRET
- *   OAUTH_REDIRECT_BASE  (예: https://your-domain.com)
+ *   OAUTH_REDIRECT_BASE  (e.g. https://your-domain.com)
  */
 
 #include "https_client.hpp"
@@ -39,21 +39,21 @@
 
 namespace qbuem_routine::oauth {
 
-// ── 사용자 정보 (프로바이더 공통) ────────────────────────────────────────────
+// ── User info (common across providers) ──────────────────────────────────────
 
 struct UserInfo {
     std::string provider;     ///< google | github | discord | microsoft | facebook | naver | kakao
-    std::string provider_id;  ///< 프로바이더 내 고유 ID
+    std::string provider_id;  ///< Unique ID within the provider
     std::string email;
     std::string name;
     std::string avatar_url;
 };
 
-// ── 내부 헬퍼 ────────────────────────────────────────────────────────────────
+// ── Internal helpers ──────────────────────────────────────────────────────────
 
 namespace detail {
 
-// 쿼리 스트링 파싱 (key=val&key2=val2)
+// Query string parsing (key=val&key2=val2)
 [[nodiscard]] inline std::unordered_map<std::string, std::string>
 parse_query(std::string_view qs) {
     std::unordered_map<std::string, std::string> m;
@@ -71,9 +71,9 @@ parse_query(std::string_view qs) {
     return m;
 }
 
-// Zero-copy fast-path: 이스케이프 시퀀스 없는 문자열 필드를 string_view로 반환.
-// 이스케이프 포함이거나 필드가 없으면 빈 뷰 반환 (json_get_field로 fallback).
-// 반환 뷰의 수명은 json 파라미터와 동일.
+// Zero-copy fast-path: returns string_view for string fields with no escape sequences.
+// Returns empty view if field contains escapes or is absent (falls back to json_get_field).
+// Lifetime of returned view matches the json parameter.
 [[nodiscard]] inline std::string_view json_get_field_view(std::string_view json,
                                                            std::string_view key) {
     auto k = std::format(R"("{}":")", key);
@@ -83,16 +83,16 @@ parse_query(std::string_view qs) {
     auto start = pos;
     while (pos < json.size() && json[pos] != '"' && json[pos] != '\\')
         ++pos;
-    if (pos >= json.size() || json[pos] == '\\') return {};  // 이스케이프 or 미종료
+    if (pos >= json.size() || json[pos] == '\\') return {};  // escape or unterminated
     return json.substr(start, pos - start);
 }
 
-// JSON에서 문자열 필드 추출 ("key":"val") — JSON 이스케이프 시퀀스 완전 처리
-// 스칼라 필드 ("key":123/true/null)도 지원
+// Extracts a string field from JSON ("key":"val") — fully handles JSON escape sequences
+// Also supports scalar fields ("key":123/true/null)
 [[nodiscard]] inline std::string json_get_field(std::string_view json,
                                                  std::string_view key) {
-    // ── 문자열 형식: "key":"value" ──────────────────────────────────────────
-    // Fast path: 이스케이프 없는 경우 zero-copy view → string 변환
+    // ── String format: "key":"value" ─────────────────────────────────────────
+    // Fast path: zero-copy view → string conversion for unescaped values
     if (auto v = json_get_field_view(json, key); !v.empty())
         return std::string{v};
 
@@ -103,7 +103,7 @@ parse_query(std::string_view qs) {
         std::string out;
         while (pos < json.size() && json[pos] != '"') {
             if (json[pos] == '\\' && pos + 1 < json.size()) {
-                ++pos;  // 백슬래시 건너뜀
+                ++pos;  // skip backslash
                 switch (json[pos]) {
                     case '"':  out += '"';  break;
                     case '\\': out += '\\'; break;
@@ -113,7 +113,7 @@ parse_query(std::string_view qs) {
                     case 't':  out += '\t'; break;
                     case 'b':  out += '\b'; break;
                     case 'f':  out += '\f'; break;
-                    default:   out += json[pos]; break;  // \uXXXX 등은 근사 처리
+                    default:   out += json[pos]; break;  // \uXXXX etc. handled approximately
                 }
             } else {
                 out += json[pos];
@@ -123,18 +123,18 @@ parse_query(std::string_view qs) {
         return out;
     }
 
-    // ── 스칼라 형식: "key":value (숫자, boolean, null) ─────────────────────
+    // ── Scalar format: "key":value (number, boolean, null) ───────────────────
     auto k_int = std::format(R"("{}":)", key);
     pos = json.find(k_int);
     if (pos != std::string_view::npos) {
         pos += k_int.size();
-        while (pos < json.size() && json[pos] == ' ') ++pos;  // 선행 공백 제거
+        while (pos < json.size() && json[pos] == ' ') ++pos;  // skip leading spaces
         auto end = pos;
         while (end < json.size() && json[end] != ',' &&
                json[end] != '}' && json[end] != ']') {
             ++end;
         }
-        // 후행 공백 제거
+        // Trim trailing spaces
         while (end > pos && json[end - 1] == ' ') --end;
         auto val = json.substr(pos, end - pos);
         if (val == "null") return {};
@@ -143,14 +143,14 @@ parse_query(std::string_view qs) {
     return {};
 }
 
-// 중첩 JSON 객체 내부 추출 ("key":{ ... })
-// 반환: { 다음 위치부터의 string_view. key가 없으면 빈 string_view 반환.
-// ※ fallback으로 전체 json을 반환하지 않음 — 잘못된 필드 매칭 방지
+// Extracts a nested JSON object ("key":{ ... })
+// Returns: string_view starting after the opening brace. Returns empty string_view if key absent.
+// Note: does not fall back to returning the full json — prevents incorrect field matching
 [[nodiscard]] inline std::string_view json_get_obj(std::string_view json,
                                                     std::string_view key) {
     auto k = std::format(R"("{}":{{)", key);
     auto pos = json.find(k);
-    if (pos == std::string_view::npos) return {};  // key 없으면 빈 뷰 반환
+    if (pos == std::string_view::npos) return {};  // key absent → return empty view
     return json.substr(pos + k.size());
 }
 
@@ -165,9 +165,9 @@ inline std::string redirect_base() {
 
 } // namespace detail
 
-// ── CSRF state 관리 (인메모리, TTL 10분, 샤딩된 스레드 안전) ───────────────────
-// 모든 프로바이더가 공유하므로 프로바이더 선언보다 먼저 위치해야 합니다.
-// 단일 글로벌 mutex 대신 kShards개의 독립 mutex로 경합 분산.
+// ── CSRF state management (in-memory, 10-minute TTL, sharded thread-safe) ────
+// Shared by all providers, so must be declared before any provider definitions.
+// Uses kShards independent mutexes instead of a single global mutex to distribute contention.
 
 namespace state_store {
 
@@ -182,11 +182,11 @@ struct Shard {
     std::unordered_map<std::string, Entry>  states;
 };
 
-// 샤드 배열은 inline variable로 ODR-safe 전역 공유
+// Shard array is an inline variable for ODR-safe global sharing
 inline std::array<Shard, kShards> g_shards;
 
 [[nodiscard]] inline Shard& shard_for(std::string_view key) {
-    // FNV-1a 기반 빠른 해시 (std::hash<string_view>는 구현 의존적이라 직접 사용)
+    // Fast FNV-1a based hash (std::hash<string_view> is implementation-defined, so used directly)
     size_t h = 14695981039346656037ull;
     for (unsigned char c : key) h = (h ^ c) * 1099511628211ull;
     return g_shards[h % kShards];
@@ -201,7 +201,7 @@ inline void purge_expired_locked(Shard& shard, int64_t now) {
 
 } // namespace detail_ss
 
-/// CSRF 토큰 발급 (TTL 10분). 해당 샤드의 만료 토큰 자동 정리.
+/// Issues a CSRF token (10-minute TTL). Automatically purges expired tokens in the shard.
 inline std::string issue() {
     using namespace std::chrono;
     const int64_t now = duration_cast<seconds>(
@@ -215,7 +215,7 @@ inline std::string issue() {
     return state;
 }
 
-/// 검증 + 소비 (1회용). 유효하고 만료되지 않은 경우에만 true.
+/// Verifies and consumes the token (one-time use). Returns true only if valid and not expired.
 inline bool verify_and_consume(std::string_view state) {
     using namespace std::chrono;
     const int64_t now = duration_cast<seconds>(
@@ -253,7 +253,7 @@ struct GoogleProvider {
     exchange(std::string_view code, std::string_view state) {
         if (!state_store::verify_and_consume(state)) co_return std::nullopt;
 
-        // 1. 코드 → 액세스 토큰
+        // 1. Code → access token
         const std::string body = std::format(
             "code={}&client_id={}&client_secret={}"
             "&redirect_uri={}&grant_type=authorization_code",
@@ -269,7 +269,7 @@ struct GoogleProvider {
         const auto access_token = detail::json_get_field(token_resp.body, "access_token");
         if (access_token.empty()) co_return std::nullopt;
 
-        // 2. 사용자 정보
+        // 2. User info
         const std::string auth_header =
             std::format("Authorization: Bearer {}\r\n", access_token);
         auto info_resp = co_await https::get(
@@ -288,7 +288,7 @@ struct GoogleProvider {
 };
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Naver Login (한국 특화)
+// Naver Login (Korea-specific)
 // ═════════════════════════════════════════════════════════════════════════════
 
 struct NaverProvider {
@@ -307,7 +307,7 @@ struct NaverProvider {
     exchange(std::string_view code, std::string_view state) {
         if (!state_store::verify_and_consume(state)) co_return std::nullopt;
 
-        // 1. 코드 → 액세스 토큰 (Naver 스펙: state를 토큰 요청에도 포함)
+        // 1. Code → access token (Naver spec: state must also be included in token request)
         const std::string body = std::format(
             "grant_type=authorization_code&client_id={}&client_secret={}"
             "&code={}&state={}",
@@ -323,14 +323,14 @@ struct NaverProvider {
         const auto access_token = detail::json_get_field(token_resp.body, "access_token");
         if (access_token.empty()) co_return std::nullopt;
 
-        // 2. 사용자 정보
+        // 2. User info
         const std::string auth_header =
             std::format("Authorization: Bearer {}\r\n", access_token);
         auto info_raw = co_await https::get(
             "https://openapi.naver.com/v1/nid/me", auth_header);
         if (!info_raw.ok()) co_return std::nullopt;
 
-        // Naver 응답: {"resultcode":"00","message":"success","response":{...}}
+        // Naver response: {"resultcode":"00","message":"success","response":{...}}
         const auto& j = info_raw.body;
         const auto resp_json = detail::json_get_obj(j, "response");
         if (resp_json.empty()) co_return std::nullopt;
@@ -346,7 +346,7 @@ struct NaverProvider {
 };
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Kakao Login (한국 특화)
+// Kakao Login (Korea-specific)
 // ═════════════════════════════════════════════════════════════════════════════
 
 struct KakaoProvider {
@@ -365,7 +365,7 @@ struct KakaoProvider {
     exchange(std::string_view code, std::string_view state) {
         if (!state_store::verify_and_consume(state)) co_return std::nullopt;
 
-        // 1. 코드 → 액세스 토큰
+        // 1. Code → access token
         const std::string body = std::format(
             "grant_type=authorization_code&client_id={}&redirect_uri={}&code={}",
             qbuem::url_encode(detail::env_or("KAKAO_CLIENT_ID")),
@@ -379,26 +379,26 @@ struct KakaoProvider {
         const auto access_token = detail::json_get_field(token_resp.body, "access_token");
         if (access_token.empty()) co_return std::nullopt;
 
-        // 2. 사용자 정보
+        // 2. User info
         const std::string auth_header =
             std::format("Authorization: Bearer {}\r\n", access_token);
         auto info_resp = co_await https::get(
             "https://kapi.kakao.com/v2/user/me", auth_header);
         if (!info_resp.ok()) co_return std::nullopt;
 
-        // 카카오 응답 구조:
+        // Kakao response structure:
         // {"id":1234,"kakao_account":{"email":"..","profile":{"nickname":"..","profile_image_url":".."}}}
         const auto& j = info_resp.body;
 
-        // "id"는 정수 필드 — json_get_field가 스칼라 형식 자동 처리
+        // "id" is an integer field — json_get_field handles scalar format automatically
         const auto id = detail::json_get_field(j, "id");
 
-        // 중첩 객체 접근: kakao_account → profile
-        // kakao_account 누락은 비정상 응답 — nullopt 반환
+        // Nested object access: kakao_account → profile
+        // Missing kakao_account is an abnormal response — return nullopt
         auto acc_json  = detail::json_get_obj(j, "kakao_account");
         if (acc_json.empty()) co_return std::nullopt;
 
-        // profile 누락 시 name/avatar_url은 빈 문자열로 처리 (치명적 오류 아님)
+        // Missing profile is not fatal — name/avatar_url treated as empty strings
         auto prof_json = detail::json_get_obj(acc_json, "profile");
         std::string name, avatar_url;
         if (!prof_json.empty()) {
@@ -436,8 +436,8 @@ struct GitHubProvider {
     exchange(std::string_view code, std::string_view state) {
         if (!state_store::verify_and_consume(state)) co_return std::nullopt;
 
-        // 1. 코드 → 액세스 토큰
-        // GitHub은 Accept: application/json 없으면 form 인코딩으로 반환
+        // 1. Code → access token
+        // GitHub returns form-encoded response without Accept: application/json
         const std::string body = std::format(
             "client_id={}&client_secret={}&code={}&redirect_uri={}",
             qbuem::url_encode(detail::env_or("GITHUB_CLIENT_ID")),
@@ -454,8 +454,8 @@ struct GitHubProvider {
         const auto access_token = detail::json_get_field(token_resp.body, "access_token");
         if (access_token.empty()) co_return std::nullopt;
 
-        // 2. 사용자 정보
-        // GitHub API는 User-Agent 헤더 필수, Authorization Bearer 사용
+        // 2. User info
+        // GitHub API requires User-Agent header and uses Authorization Bearer
         const std::string auth_header = std::format(
             "Authorization: Bearer {}\r\n"
             "Accept: application/vnd.github+json\r\n"
@@ -469,12 +469,12 @@ struct GitHubProvider {
         const auto& j = info_resp.body;
         auto email = detail::json_get_field(j, "email");
 
-        // email이 비어 있으면 (null 또는 비공개) /user/emails에서 primary 이메일 조회
+        // If email is empty (null or private), fetch primary email from /user/emails
         if (email.empty()) {
             auto emails_resp = co_await https::get(
                 "https://api.github.com/user/emails", auth_header);
             if (emails_resp.ok()) {
-                // 배열 항목 중 "primary":true 인 객체의 email 추출
+                // Extract email from the array entry with "primary":true
                 const auto& ea = emails_resp.body;
                 auto primary_pos = ea.find(R"("primary":true)");
                 if (primary_pos != std::string::npos) {
@@ -517,7 +517,7 @@ struct DiscordProvider {
     exchange(std::string_view code, std::string_view state) {
         if (!state_store::verify_and_consume(state)) co_return std::nullopt;
 
-        // 1. 코드 → 액세스 토큰
+        // 1. Code → access token
         const std::string body = std::format(
             "client_id={}&client_secret={}&grant_type=authorization_code"
             "&code={}&redirect_uri={}",
@@ -533,7 +533,7 @@ struct DiscordProvider {
         const auto access_token = detail::json_get_field(token_resp.body, "access_token");
         if (access_token.empty()) co_return std::nullopt;
 
-        // 2. 사용자 정보
+        // 2. User info
         const std::string auth_header =
             std::format("Authorization: Bearer {}\r\n", access_token);
         auto info_resp = co_await https::get(
@@ -544,13 +544,13 @@ struct DiscordProvider {
         const auto id     = detail::json_get_field(j, "id");
         const auto avatar = detail::json_get_field(j, "avatar");
 
-        // 아바타 URL 조합: id + avatar 해시 → CDN URL
+        // Construct avatar URL: id + avatar hash → CDN URL
         std::string avatar_url;
         if (!avatar.empty())
             avatar_url = std::format(
                 "https://cdn.discordapp.com/avatars/{}/{}.png", id, avatar);
 
-        // 표시 이름: global_name 우선, 없으면 username
+        // Display name: prefer global_name, fall back to username
         auto name = detail::json_get_field(j, "global_name");
         if (name.empty())
             name = detail::json_get_field(j, "username");
@@ -588,7 +588,7 @@ struct MicrosoftProvider {
     exchange(std::string_view code, std::string_view state) {
         if (!state_store::verify_and_consume(state)) co_return std::nullopt;
 
-        // 1. 코드 → 액세스 토큰 (테넌트별 엔드포인트)
+        // 1. Code → access token (tenant-specific endpoint)
         const auto tenant = detail::env_or("MICROSOFT_TENANT_ID", "common");
         const std::string body = std::format(
             "client_id={}&client_secret={}&grant_type=authorization_code"
@@ -606,7 +606,7 @@ struct MicrosoftProvider {
         const auto access_token = detail::json_get_field(token_resp.body, "access_token");
         if (access_token.empty()) co_return std::nullopt;
 
-        // 2. 사용자 정보 (Microsoft Graph API)
+        // 2. User info (Microsoft Graph API)
         const std::string auth_header =
             std::format("Authorization: Bearer {}\r\n", access_token);
         auto info_resp = co_await https::get(
@@ -615,13 +615,14 @@ struct MicrosoftProvider {
 
         const auto& j = info_resp.body;
 
-        // 이메일: mail (Exchange) 또는 userPrincipalName (개인 계정) 순서로 시도
+        // Email: try mail (Exchange) first, then userPrincipalName (personal account)
         auto email = detail::json_get_field(j, "mail");
         if (email.empty())
             email = detail::json_get_field(j, "userPrincipalName");
 
-        // Graph API 프로필 사진은 /me/photo/$value 에서 바이너리로 반환됨.
-        // 공개 URL이 없으므로 엔드포인트 경로를 저장하여 호출자가 Bearer 토큰으로 직접 요청하도록 함.
+        // Graph API profile photo is returned as binary from /me/photo/$value.
+        // No public URL exists, so the endpoint path is stored for the caller
+        // to request directly with a Bearer token.
         const auto photo_meta_resp = co_await https::get(
             "https://graph.microsoft.com/v1.0/me/photo", auth_header);
         const std::string avatar_url = photo_meta_resp.ok()
@@ -658,8 +659,8 @@ struct FacebookProvider {
     exchange(std::string_view code, std::string_view state) {
         if (!state_store::verify_and_consume(state)) co_return std::nullopt;
 
-        // 1. 코드 → 액세스 토큰 (POST 사용: client_secret을 URL이 아닌 바디에 포함)
-        // GET으로 처리하면 client_secret이 URL에 노출되어 서버 로그 등에 기록됨
+        // 1. Code → access token (using POST: keeps client_secret in body, not URL)
+        // Using GET would expose client_secret in the URL, which may be logged by servers
         const std::string token_body = std::format(
             "client_id={}&client_secret={}&code={}&redirect_uri={}",
             qbuem::url_encode(detail::env_or("FACEBOOK_CLIENT_ID")),
@@ -674,7 +675,7 @@ struct FacebookProvider {
         const auto access_token = detail::json_get_field(token_resp.body, "access_token");
         if (access_token.empty()) co_return std::nullopt;
 
-        // 2. 사용자 정보 (필요 필드 명시, picture 포함)
+        // 2. User info (explicit fields including picture)
         const std::string auth_header =
             std::format("Authorization: Bearer {}\r\n", access_token);
         auto info_resp = co_await https::get(
@@ -683,8 +684,8 @@ struct FacebookProvider {
             auth_header);
         if (!info_resp.ok()) co_return std::nullopt;
 
-        // 프로필 사진 중첩 구조: {"picture":{"data":{"url":"..."}}}
-        // 각 단계마다 empty() guard 적용 — 누락 시 빈 avatar_url
+        // Profile picture nested structure: {"picture":{"data":{"url":"..."}}}
+        // empty() guard applied at each level — missing picture yields empty avatar_url
         const auto& j = info_resp.body;
         std::string avatar_url;
         if (auto pic_data = detail::json_get_obj(j, "picture"); !pic_data.empty()) {

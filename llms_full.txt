@@ -1,4 +1,4 @@
-# qbuem-auth — 전체 소스 코드
+# qbuem-auth — Full Source Code
 
 ## src/auth/jwt.hpp
 

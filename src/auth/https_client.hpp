@@ -2,14 +2,14 @@
 
 /**
  * @file auth/https_client.hpp
- * @brief 경량 HTTPS 클라이언트 (OpenSSL BIO + eventfd 비동기 래퍼)
+ * @brief Lightweight HTTPS client (OpenSSL BIO + eventfd async wrapper)
  *
- * 고성능 설계:
- * - ThreadPool  : OS 스레드를 재사용 (요청마다 thread 생성·파괴 없음)
- * - ConnPool    : TLS 세션을 호스트별로 재사용 (핸드셰이크 비용 제거)
- *                 Connection: keep-alive + Content-Length 기반 수신
- * - shared_ssl_ctx : SSL_CTX 를 프로세스당 1회 생성
- * - zero-copy body : erase-front + move 로 헤더 제거, 별도 resp_body 할당 없음
+ * High-performance design:
+ * - ThreadPool  : Reuses OS threads (no thread creation/destruction per request)
+ * - ConnPool    : Reuses TLS sessions per host (eliminates handshake cost)
+ *                 Connection: keep-alive + Content-Length based receive
+ * - shared_ssl_ctx : SSL_CTX created once per process
+ * - zero-copy body : Header removal via erase-front + move, no separate resp_body allocation
  */
 
 #include <qbuem/core/reactor.hpp>
@@ -45,7 +45,7 @@
 
 namespace qbuem_routine::https {
 
-// ── 응답 구조체 ───────────────────────────────────────────────────────────────
+// ── Response struct ───────────────────────────────────────────────────────────
 
 struct Response {
     int         status = 0;
@@ -81,8 +81,8 @@ struct Response {
 // ─────────────────────────────────────────────────────────────────────────────
 namespace detail {
 
-// ── SSL_CTX 공유 싱글톤 ───────────────────────────────────────────────────────
-// 프로세스당 1회 생성. SSL_CTX는 내부적으로 스레드 안전.
+// ── Shared SSL_CTX singleton ──────────────────────────────────────────────────
+// Created once per process. SSL_CTX is internally thread-safe.
 
 [[nodiscard]] inline SSL_CTX* shared_ssl_ctx() {
     static SSL_CTX* ctx = []() -> SSL_CTX* {
@@ -98,8 +98,8 @@ namespace detail {
     return ctx;
 }
 
-// ── 스레드 풀 ─────────────────────────────────────────────────────────────────
-// 고정 크기 워커 풀. OS 스레드 생성·파괴 비용 제거.
+// ── Thread pool ───────────────────────────────────────────────────────────────
+// Fixed-size worker pool. Eliminates OS thread creation/destruction cost.
 
 class ThreadPool {
 public:
@@ -148,9 +148,9 @@ private:
     bool                              stop_ = false;
 };
 
-// ── 커넥션 풀 ─────────────────────────────────────────────────────────────────
-// TLS 세션을 호스트별로 보관·재사용. 유휴 25초 초과 시 자동 폐기.
-// keep-alive 연결은 Content-Length 수신 완료 후 반환.
+// ── Connection pool ───────────────────────────────────────────────────────────
+// Stores and reuses TLS sessions per host. Automatically discards entries idle for more than 25s.
+// keep-alive connections are returned to pool after Content-Length receive completes.
 
 class ConnPool {
 public:
@@ -159,10 +159,10 @@ public:
         std::chrono::steady_clock::time_point      last_used;
     };
 
-    static constexpr std::chrono::seconds kMaxIdle{25}; // 서버 keep-alive보다 짧게
+    static constexpr std::chrono::seconds kMaxIdle{25}; // Shorter than server keep-alive
     static constexpr size_t               kMaxPerHost{4};
 
-    // 사용 가능한 커넥션 반환. 없으면 nullptr.
+    // Returns an available connection, or nullptr if none.
     [[nodiscard]] BIO* acquire(std::string_view key) {
         const auto now = std::chrono::steady_clock::now();
         std::lock_guard lock{mu_};
@@ -173,12 +173,12 @@ public:
             Entry e = vec.back();
             vec.pop_back();
             if (now - e.last_used < kMaxIdle) return e.bio;
-            BIO_free_all(e.bio);  // 유휴 시간 초과 → 폐기
+            BIO_free_all(e.bio);  // Idle timeout exceeded → discard
         }
         return nullptr;
     }
 
-    // 사용 완료된 커넥션 반환. 풀이 가득 찬 경우 폐기.
+    // Returns a used connection to the pool. Discards if pool is full.
     void release(std::string_view key, BIO* bio) {
         const auto now = std::chrono::steady_clock::now();
         std::lock_guard lock{mu_};
@@ -199,12 +199,12 @@ private:
     std::unordered_map<std::string, std::vector<Entry>> pool_;
 };
 
-// ── 핵심 HTTP 요청 로직 ───────────────────────────────────────────────────────
-// BIO*를 받아 1회 요청 수행.
-// 반환: {Response, reusable}
-//   reusable=true  → Content-Length로 정확히 읽음, 커넥션 재사용 가능
-//   reusable=false → EOF까지 읽음 or 오류, 커넥션 폐기
-// nullopt → 전송 실패 (stale 커넥션 감지 → 재연결 트리거)
+// ── Core HTTP request logic ───────────────────────────────────────────────────
+// Accepts a BIO* and performs a single request.
+// Returns: {Response, reusable}
+//   reusable=true  → Read exactly via Content-Length, connection reusable
+//   reusable=false → Read until EOF or error, connection discarded
+// nullopt → Transmission failed (stale connection detected → triggers reconnect)
 
 [[nodiscard]] inline std::optional<std::pair<Response, bool>>
 do_request(BIO*             bio,
@@ -215,7 +215,7 @@ do_request(BIO*             bio,
            std::string_view content_type,
            std::string_view extra_headers)
 {
-    // ── 요청 전송 ────────────────────────────────────────────────────────────
+    // ── Send request ─────────────────────────────────────────────────────────
     std::string req = std::format("{} {} HTTP/1.1\r\nHost: {}\r\n", method, path, host);
     if (!req_body.empty()) {
         if (!content_type.empty())
@@ -226,10 +226,10 @@ do_request(BIO*             bio,
     req += std::format("Connection: keep-alive\r\n\r\n{}", req_body);
 
     if (BIO_write(bio, req.data(), static_cast<int>(req.size())) <= 0)
-        return std::nullopt;  // 전송 실패 → stale 커넥션
+        return std::nullopt;  // Transmission failed → stale connection
     BIO_flush(bio);
 
-    // ── 응답 수신 (헤더 끝 \r\n\r\n 까지) ───────────────────────────────────
+    // ── Receive response (up to header terminator \r\n\r\n) ──────────────────
     std::string raw;
     raw.reserve(4096);
     char buf[4096];
@@ -313,8 +313,8 @@ do_request(BIO*             bio,
     }
 }
 
-// ── 커넥션 생명주기 관리 ──────────────────────────────────────────────────────
-// 풀에서 재사용 시도 → 실패 시 신규 연결 → 완료 후 풀 반환 or 폐기
+// ── Connection lifecycle management ──────────────────────────────────────────
+// Attempt reuse from pool → fall back to new connection → return or discard after completion
 
 [[nodiscard]] inline Response do_https(
     std::string_view host,
@@ -331,10 +331,10 @@ do_request(BIO*             bio,
     const std::string pool_key = std::format("{}:{}", host, port);
     auto& pool = ConnPool::global();
 
-    // 커넥션 관리 헬퍼: 요청 수행 후 결과에 따라 pool 반환 또는 폐기
-    // nullopt(stale) → BIO 폐기, false 반환
-    // ok + reusable  → pool 반환, Response 이동
-    // ok + !reusable → BIO 폐기, Response 이동
+    // Connection management helper: after request, return to pool or discard based on result
+    // nullopt(stale) → discard BIO, return false
+    // ok + reusable  → return to pool, move Response
+    // ok + !reusable → discard BIO, move Response
     auto try_conn = [&](BIO* bio) -> std::optional<Response> {
         auto res = do_request(bio, host, method, path, body, content_type, extra_headers);
         if (!res) { BIO_free_all(bio); return std::nullopt; }
@@ -344,13 +344,13 @@ do_request(BIO*             bio,
         return std::move(resp);
     };
 
-    // 1. 풀에서 재사용 시도
+    // 1. Attempt reuse from pool
     if (BIO* bio = pool.acquire(pool_key)) {
         if (auto resp = try_conn(bio)) return std::move(*resp);
-        // try_conn이 nullopt → stale 커넥션 폐기 완료, 신규 연결로 재시도
+        // try_conn returned nullopt → stale connection discarded, retry with new connection
     }
 
-    // 2. 신규 TLS 연결
+    // 2. New TLS connection
     BIO* bio = BIO_new_ssl_connect(ctx);
     if (!bio) return {0, "BIO_new_ssl_connect failed", {}};
 
@@ -372,7 +372,7 @@ do_request(BIO*             bio,
     return {0, "request failed", {}};
 }
 
-// ── URL 파싱 ─────────────────────────────────────────────────────────────────
+// ── URL parsing ───────────────────────────────────────────────────────────────
 
 struct ParsedUrl {
     std::string host;
@@ -478,18 +478,18 @@ struct EventFdAwaiter {
     }
 };
 
-// ── 공개 비동기 API ────────────────────────────────────────────────────────────
-// ThreadPool 워커에서 do_https() 실행 → eventfd로 완료 신호.
-// 파라미터: host/path는 parse_url()이 std::string으로 소유,
-//           body/content_type/extra_headers는 std::string으로 복사
-//           (string_view 파라미터가 co_await 중에 댕글링될 수 있으므로).
+// ── Public async API ──────────────────────────────────────────────────────────
+// Runs do_https() on a ThreadPool worker → signals completion via eventfd.
+// Parameters: host/path are owned as std::string by parse_url(),
+//             body/content_type/extra_headers are copied to std::string
+//             (string_view parameters may dangle during co_await).
 
 /**
- * @brief 비동기 HTTPS POST 요청
- * @param url          전체 URL (https://host/path?query)
- * @param body         요청 바디
- * @param content_type Content-Type 헤더 값
- * @param extra_headers 추가 헤더 문자열 (각 줄 \r\n 으로 끝나야 함)
+ * @brief Asynchronous HTTPS POST request
+ * @param url          Full URL (https://host/path?query)
+ * @param body         Request body
+ * @param content_type Content-Type header value
+ * @param extra_headers Additional header string (each line must end with \r\n)
  */
 [[nodiscard]] inline qbuem::Task<Response>
 post(std::string_view url, std::string_view body,
@@ -522,9 +522,9 @@ post(std::string_view url, std::string_view body,
 }
 
 /**
- * @brief 비동기 HTTPS GET 요청
- * @param url          전체 URL (https://host/path?query)
- * @param extra_headers 추가 헤더 문자열 (각 줄 \r\n 으로 끝나야 함)
+ * @brief Asynchronous HTTPS GET request
+ * @param url          Full URL (https://host/path?query)
+ * @param extra_headers Additional header string (each line must end with \r\n)
  */
 [[nodiscard]] inline qbuem::Task<Response>
 get(std::string_view url, std::string_view extra_headers = "")

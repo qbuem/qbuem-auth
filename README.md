@@ -1,27 +1,27 @@
 # qbuem-auth
 
-qbuem-stack 기반 C++23 인증 라이브러리.
-HS256 JWT, OpenSSL HTTPS 클라이언트(비동기 래퍼), Google/GitHub/Discord/Microsoft/Facebook/Naver/Kakao OAuth2 를 제공합니다.
+C++23 authentication library built on qbuem-stack.
+HS256 JWT, OpenSSL HTTPS client (async wrapper), and OAuth2 for Google / GitHub / Discord / Microsoft / Facebook / Naver / Kakao.
 
-## 제공 컴포넌트
+## Components
 
-| 파일 | 설명 |
-|------|------|
-| `src/auth/jwt.hpp` | HS256 JWT 생성·검증 (OpenSSL 불필요, qbuem::crypto 전용) |
-| `src/auth/https_client.hpp` | 경량 HTTPS 클라이언트 (OpenSSL BIO + eventfd 비동기 래퍼) |
-| `src/auth/oauth.hpp` | Google / GitHub / Discord / Microsoft / Facebook / Naver / Kakao OAuth2 프로바이더 |
+| File | Description |
+|------|-------------|
+| `src/auth/jwt.hpp` | HS256 JWT creation and verification (qbuem::crypto only, no OpenSSL) |
+| `src/auth/https_client.hpp` | Lightweight HTTPS client (OpenSSL BIO + eventfd async wrapper) |
+| `src/auth/oauth.hpp` | Google / GitHub / Discord / Microsoft / Facebook / Naver / Kakao OAuth2 providers |
 
-## 빌드 의존성
+## Build Dependencies
 
-| 의존성 | 관리 방법 |
-|--------|---------|
-| qbuem-stack | `FetchContent` (GIT) |
-| OpenSSL | `find_package(OpenSSL REQUIRED)` — HTTPS TLS 전용 |
+| Dependency | Management | Purpose |
+|------------|-----------|---------|
+| qbuem-stack | `FetchContent` (GIT) | Interfaces, Reactor, Task, crypto |
+| OpenSSL | `find_package(OpenSSL REQUIRED)` | HTTPS TLS only |
 
-> JWT는 qbuem::crypto (HMAC-SHA256 + Base64url) 만으로 구현되어 OpenSSL이 필요 없습니다.
-> OpenSSL은 OAuth 아웃바운드 HTTPS 요청(`https_client.hpp`)에만 사용됩니다.
+> JWT is implemented using `qbuem::crypto` (HMAC-SHA256 + Base64url) only — no OpenSSL required.
+> OpenSSL is used exclusively for outbound OAuth HTTPS requests (`https_client.hpp`).
 
-## 사용법 (FetchContent)
+## Usage (FetchContent)
 
 ```cmake
 FetchContent_Declare(
@@ -38,32 +38,32 @@ target_link_libraries(your_target PRIVATE qbuem-auth::auth)
 
 ## JWT (`src/auth/jwt.hpp`)
 
-RFC 7519 HS256 JWT 생성·검증. qbuem::crypto 모듈만 사용합니다.
+RFC 7519 HS256 JWT creation and verification. Uses only the `qbuem::crypto` module.
 
-### Claims 구조
+### Claims Structure
 
 ```cpp
 struct Claims {
-    int64_t     sub;        // 사용자 DB ID
+    int64_t     sub;        // User DB ID
     std::string provider;   // "google" | "naver" | "kakao"
     std::string email;
     std::string name;
-    int64_t     iat;        // 발급 시각 (Unix 초)
-    int64_t     exp;        // 만료 시각 (Unix 초)
+    int64_t     iat;        // Issued-at (Unix seconds)
+    int64_t     exp;        // Expiry (Unix seconds)
     TokenType   type;       // TokenType::Access | TokenType::Refresh
 };
 ```
 
-### 만료 기간
+### TTL Constants
 
-| 상수 | 값 |
-|------|-----|
-| `kAccessTokenTTL`  | 24시간 |
-| `kRefreshTokenTTL` | 30일 |
+| Constant | Value |
+|----------|-------|
+| `kAccessTokenTTL`  | 24 hours |
+| `kRefreshTokenTTL` | 30 days |
 
-### 비밀 키 관리
+### Secret Key Management
 
-환경변수 `JWT_SECRET` (≤32 bytes)이 있으면 사용, 없으면 프로세스 시작 시 CSPRNG로 32-byte 키 자동 생성.
+If the environment variable `JWT_SECRET` (≤ 32 bytes) is set it is used as the signing key; otherwise a 32-byte key is auto-generated via CSPRNG at process startup.
 
 ### API
 
@@ -71,73 +71,72 @@ struct Claims {
 #include "auth/jwt.hpp"
 using namespace qbuem_routine;
 
-// 액세스 토큰 발급 (TTL: 24h)
+// Issue access token (TTL: 24h)
 std::string access_token = jwt::encode(claims);
 
-// 리프레시 토큰 발급 (TTL: 30d)
+// Issue refresh token (TTL: 30d)
 std::string refresh_token = jwt::encode_refresh(claims);
 
-// 액세스 토큰 검증 + Claims 추출 (만료/서명/종류 불일치 시 nullopt)
+// Verify access token + extract Claims (returns nullopt on expiry/signature/type mismatch)
 std::optional<jwt::Claims> c = jwt::decode(token);
 
-// 리프레시 토큰 검증
+// Verify refresh token
 std::optional<jwt::Claims> c = jwt::decode(token, jwt::TokenType::Refresh);
 
-// Authorization 헤더에서 Bearer 토큰 추출
+// Extract Bearer token from Authorization header
 std::optional<std::string_view> t = jwt::extract_bearer(auth_header);
 ```
 
-### 토큰 갱신 흐름 예시
+### Token Refresh Flow
 
 ```cpp
-// 리프레시 토큰으로 새 액세스 토큰 발급
 auto rc = jwt::decode(refresh_token, jwt::TokenType::Refresh);
-if (!rc) { /* 만료 또는 위조 → 재로그인 요청 */ }
+if (!rc) { /* expired or tampered → request re-login */ }
 std::string new_access = jwt::encode(*rc);
 ```
 
-### 내부 구현
+### Internal Implementation
 
 ```
-토큰 = base64url({"alg":"HS256","typ":"JWT"})
-     . base64url(payload_json)
-     . base64url(HMAC-SHA256(header.payload, secret))
+token = base64url({"alg":"HS256","typ":"JWT"})
+      . base64url(payload_json)
+      . base64url(HMAC-SHA256(header.payload, secret))
 ```
 
-- 서명 검증: `qbuem::crypto::constant_time_equal()` (타이밍 오라클 방지)
-- Payload에 `"type":"access"|"refresh"` 필드 포함 → `decode()` 시 종류 검증
-- Base64url: 패딩 없음 (`false`)
+- Signature verification: `qbuem::crypto::constant_time_equal()` (timing-safe)
+- Payload includes `"type":"access"|"refresh"` field — type mismatch is rejected in `decode()`
+- Base64url: no padding (`false`)
 
 ---
 
-## HTTPS 클라이언트 (`src/auth/https_client.hpp`)
+## HTTPS Client (`src/auth/https_client.hpp`)
 
-OAuth 토큰 교환 등 빈도가 낮은 아웃바운드 HTTPS 요청 전용 경량 클라이언트.
+Lightweight HTTPS client for low-frequency outbound requests such as OAuth token exchanges.
 
-### 비동기 구현 패턴
+### Async Implementation Pattern
 
 ```
 co_await https::post(url, body)
   │
-  ├─ eventfd 생성
-  ├─ std::thread::detach()  → OpenSSL BIO 블로킹 I/O (Reactor 스레드 비블로킹)
-  │     └─ 완료 시 eventfd write(1)
+  ├─ create eventfd
+  ├─ std::thread::detach()  → OpenSSL BIO blocking I/O (Reactor thread non-blocking)
+  │     └─ on complete: eventfd write(1)
   └─ EventFdAwaiter
         ├─ Reactor::register_event(efd, Read, ...)
-        └─ 완료 이벤트 → Reactor::post(coroutine.resume())
+        └─ completion event → Reactor::post(coroutine.resume())
 ```
 
-블로킹 OpenSSL 호출을 별도 스레드에서 실행하고, 완료를 eventfd로 Reactor에 알려 코루틴을 재개합니다. Reactor 스레드는 블로킹되지 않습니다.
+Blocking OpenSSL calls run in a separate thread; completion is signalled to the Reactor via eventfd to resume the coroutine. The Reactor thread is never blocked.
 
-### TLS 설정
+### TLS Configuration
 
-- `SSL_CTX_set_default_verify_paths()` — 시스템 CA 번들 사용
-- `SSL_VERIFY_PEER` — 인증서 검증 활성화
-- SNI 지원 (`SSL_set_tlsext_host_name`)
+- `SSL_CTX_set_default_verify_paths()` — system CA bundle
+- `SSL_VERIFY_PEER` — certificate verification enabled
+- SNI support (`SSL_set_tlsext_host_name`)
 - HTTP/1.1, `Connection: close`
-- `ssl_init()` — `std::call_once` 로 스레드 안전 초기화
+- `ssl_init()` — thread-safe one-time initialization via `std::call_once`
 
-### Response 구조체
+### Response Struct
 
 ```cpp
 struct Response {
@@ -153,11 +152,11 @@ struct Response {
 #include "auth/https_client.hpp"
 using namespace qbuem_routine;
 
-// POST (기본 Content-Type: application/x-www-form-urlencoded)
+// POST (default Content-Type: application/x-www-form-urlencoded)
 auto resp = co_await https::post(url, body);
 auto resp = co_await https::post(url, body, "application/json");
 
-// POST + 추가 헤더
+// POST with extra headers
 auto resp = co_await https::post(url, body,
     "application/x-www-form-urlencoded",
     "Authorization: Bearer token\r\n");
@@ -165,19 +164,19 @@ auto resp = co_await https::post(url, body,
 // GET
 auto resp = co_await https::get(url);
 
-// GET + 추가 헤더
+// GET with extra headers
 auto resp = co_await https::get(url, "Authorization: Bearer token\r\n");
 
 if (resp.ok()) { /* resp.body ... */ }
 ```
 
-### URL 파싱
+### URL Parsing
 
-`https://host[:port]/path?query` 형식 자동 파싱. 포트 기본값 443 (http: 80).
+Automatically parses `https://host[:port]/path?query` format. Default port: 443 (http: 80).
 
-### 추가 헤더 형식
+### Extra Headers Format
 
-`extra_headers` 파라미터는 각 헤더를 `\r\n` 으로 끝내는 문자열을 이어 붙인 형태입니다.
+The `extra_headers` parameter is a concatenated string of headers, each terminated with `\r\n`:
 
 ```cpp
 "Authorization: Bearer abc123\r\n"
@@ -188,9 +187,9 @@ if (resp.ok()) { /* resp.body ... */ }
 
 ## OAuth2 (`src/auth/oauth.hpp`)
 
-Google, Naver(한국), Kakao(한국) OAuth2 프로바이더 통합.
+Google, Naver, Kakao, GitHub, Discord, Microsoft, and Facebook OAuth2 provider integrations.
 
-### 인증 흐름
+### Auth Flow
 
 ```
 1. GET /auth/{provider}/login
@@ -199,29 +198,29 @@ Google, Naver(한국), Kakao(한국) OAuth2 프로바이더 통합.
 
 2. GET /auth/{provider}/callback?code=...&state=...
    ├─ Provider::exchange(code, state)
-   │    ├─ state_store::verify_and_consume(state)  →  CSRF 검증 (실패 시 nullopt)
+   │    ├─ state_store::verify_and_consume(state)  →  CSRF check (nullopt on failure)
    │    ├─ co_await https::post(token_endpoint, body)  →  access_token
    │    └─ co_await https::get(userinfo_endpoint, "Authorization: Bearer ...")  →  UserInfo
-   └─  jwt::encode(Claims{...})  →  액세스 토큰
-       jwt::encode_refresh(Claims{...})  →  리프레시 토큰
+   └─  jwt::encode(Claims{...})  →  access token
+       jwt::encode_refresh(Claims{...})  →  refresh token
 ```
 
-### UserInfo 구조체
+### UserInfo Struct
 
 ```cpp
 struct UserInfo {
-    std::string provider;     // "google" | "naver" | "kakao"
-    std::string provider_id;  // 프로바이더 내 고유 ID
+    std::string provider;     // "google" | "naver" | "kakao" | ...
+    std::string provider_id;  // Provider-scoped unique ID
     std::string email;
     std::string name;
     std::string avatar_url;
 };
 ```
 
-### 프로바이더별 엔드포인트
+### Provider Endpoints
 
-| 프로바이더 | 인가 URL | 토큰 엔드포인트 | 사용자 정보 |
-|-----------|---------|--------------|-----------|
+| Provider | Auth URL | Token Endpoint | Userinfo |
+|----------|---------|----------------|---------|
 | Google | accounts.google.com/o/oauth2/v2/auth | oauth2.googleapis.com/token | googleapis.com/oauth2/v3/userinfo |
 | Naver | nid.naver.com/oauth2.0/authorize | nid.naver.com/oauth2.0/token | openapi.naver.com/v1/nid/me |
 | Kakao | kauth.kakao.com/oauth/authorize | kauth.kakao.com/oauth/token | kapi.kakao.com/v2/user/me |
@@ -230,30 +229,30 @@ struct UserInfo {
 | Microsoft | login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize | login.microsoftonline.com/{tenant}/oauth2/v2.0/token | graph.microsoft.com/v1.0/me |
 | Facebook | facebook.com/v20.0/dialog/oauth | graph.facebook.com/v20.0/oauth/access_token | graph.facebook.com/v20.0/me |
 
-### CSRF State 관리
+### CSRF State Management
 
 ```cpp
-// 발급 (TTL 10분, in-memory)
+// Issue state (TTL 10 min, in-memory)
 std::string state = state_store::issue();
 
-// 검증 + 소비 (1회용) — exchange() 내부에서 자동 호출됨
+// Verify + consume (one-shot) — called automatically inside exchange()
 bool ok = state_store::verify_and_consume(state);
 ```
 
-- `qbuem::crypto::csrf_token(128)` — 128-bit CSPRNG URL-safe base64url 토큰 생성
-- `std::mutex` 로 스레드 안전 보장
-- `issue()` 호출 시 만료된 엔트리 자동 정리
-- `verify_and_consume()` — 검증과 동시에 삭제 (재사용 불가)
+- `qbuem::crypto::csrf_token(128)` — 128-bit CSPRNG URL-safe base64url token
+- Thread-safe via `std::mutex`
+- Expired entries are automatically cleaned up on `issue()`
+- `verify_and_consume()` — verifies and deletes simultaneously (not reusable)
 
-### 프로바이더 API
+### Provider API
 
-모든 `exchange()` 함수는 `state` 파라미터를 받아 **내부에서 CSRF 검증**을 수행합니다.
+All `exchange()` functions accept a `state` parameter and perform CSRF verification internally.
 
 ```cpp
 #include "auth/oauth.hpp"
 using namespace qbuem_routine;
 
-// 인가 URL 생성
+// Generate auth URL
 auto state = oauth::state_store::issue();
 std::string url = oauth::GoogleProvider::authorize_url(state);
 std::string url = oauth::NaverProvider::authorize_url(state);
@@ -263,7 +262,7 @@ std::string url = oauth::DiscordProvider::authorize_url(state);
 std::string url = oauth::MicrosoftProvider::authorize_url(state);
 std::string url = oauth::FacebookProvider::authorize_url(state);
 
-// 코드 교환 → UserInfo (state CSRF 검증 포함)
+// Exchange code → UserInfo (includes state CSRF verification)
 auto info = co_await oauth::GoogleProvider::exchange(code, state);    // optional<UserInfo>
 auto info = co_await oauth::NaverProvider::exchange(code, state);
 auto info = co_await oauth::KakaoProvider::exchange(code, state);
@@ -273,21 +272,21 @@ auto info = co_await oauth::MicrosoftProvider::exchange(code, state);
 auto info = co_await oauth::FacebookProvider::exchange(code, state);
 ```
 
-### 각 프로바이더 특이사항
+### Provider-Specific Notes
 
-| 프로바이더 | 특이사항 |
-|-----------|---------|
-| **Google** | OIDC(openid+email+profile), userinfo Authorization 헤더 사용 |
-| **Naver** | state를 토큰 요청에도 포함 (Naver 스펙) |
-| **Kakao** | `id` 필드가 정수형(`"id":1234`), `kakao_account.profile` 중첩 구조 |
-| **GitHub** | `User-Agent` 헤더 필수, `Accept: application/json` 토큰 요청 필수, 이메일 비공개 시 `/user/emails`에서 primary 이메일 자동 조회 |
-| **Discord** | 아바타 URL을 `id`+`avatar_hash`로 조합, `global_name` 없으면 `username` 사용 |
-| **Microsoft** | 테넌트 `MICROSOFT_TENANT_ID` (기본: `common`), 이메일은 `mail` → `userPrincipalName` 순 |
-| **Facebook** | 토큰 교환이 GET 방식(비표준), picture는 `picture.data.url` 중첩 구조 |
+| Provider | Notes |
+|----------|-------|
+| **Google** | OIDC (openid+email+profile), userinfo via Authorization header |
+| **Naver** | `state` included in token request (Naver spec), response unwrapped via `json_get_obj("response")` |
+| **Kakao** | `id` field is integer (`"id":1234`), `kakao_account.profile` nested structure |
+| **GitHub** | `User-Agent` header required, `Accept: application/json` on token request, falls back to `/user/emails` for private emails |
+| **Discord** | Avatar URL assembled from `id + avatar_hash`, `global_name` → `username` fallback |
+| **Microsoft** | Tenant-specific URL (`MICROSOFT_TENANT_ID`, default `common`), email from `mail` then `userPrincipalName` |
+| **Facebook** | Token exchange via POST (non-standard), `picture.data.url` nested structure |
 
-모든 프로바이더의 사용자 정보 API 액세스 토큰은 **URL 파라미터가 아닌 `Authorization: Bearer` 헤더**로 전달됩니다. (Facebook 토큰 교환 단계는 예외)
+All providers pass userinfo API access tokens via `Authorization: Bearer` header, not URL parameters. (Facebook token exchange step is an exception.)
 
-### 환경변수
+### Environment Variables
 
 ```
 GOOGLE_CLIENT_ID,    GOOGLE_CLIENT_SECRET
@@ -296,14 +295,14 @@ KAKAO_CLIENT_ID,     KAKAO_CLIENT_SECRET
 GITHUB_CLIENT_ID,    GITHUB_CLIENT_SECRET
 DISCORD_CLIENT_ID,   DISCORD_CLIENT_SECRET
 MICROSOFT_CLIENT_ID, MICROSOFT_CLIENT_SECRET
-MICROSOFT_TENANT_ID  (기본값: common — 멀티테넌트)
+MICROSOFT_TENANT_ID  (default: common — multi-tenant)
 FACEBOOK_CLIENT_ID,  FACEBOOK_CLIENT_SECRET
-OAUTH_REDIRECT_BASE  (예: https://your-domain.com, 기본값: http://localhost:8080)
+OAUTH_REDIRECT_BASE  (e.g. https://your-domain.com, default: http://localhost:8080)
 ```
 
 ---
 
-## 빌드
+## Build
 
 ```bash
 cmake -G Ninja -DCMAKE_BUILD_TYPE=Release \
@@ -313,13 +312,13 @@ cmake -G Ninja -DCMAKE_BUILD_TYPE=Release \
 cmake --build build
 ```
 
-**요구사항**: GCC ≥ 13 / Clang ≥ 17, CMake ≥ 3.20, libssl-dev (OpenSSL)
+**Requirements**: GCC ≥ 13 / Clang ≥ 17, CMake ≥ 3.20, libssl-dev (OpenSSL)
 
 ---
 
-## LLM 컨텍스트 파일
+## LLM Context Files
 
-| 파일 | 설명 |
-|------|------|
-| `llms.txt` | 핵심 API 요약 (간략) |
-| `llms_full.txt` | 전체 소스 코드 (상세) |
+| File | Description |
+|------|-------------|
+| `llms.txt` | Core API summary (concise) |
+| `llms_full.txt` | Full source code (detailed) |
