@@ -185,3 +185,6 @@ If a temporary local workaround is necessary while waiting for an upstream fix, 
 ```cpp
 // TODO: remove after qbuem-auth#NNN is merged
 ```
+
+> **Cross-repo development workflow and documentation update policy:**
+> See root workspace CLAUDE.md at `/Users/goodboy/Projects/qbuem/CLAUDE.md`.
