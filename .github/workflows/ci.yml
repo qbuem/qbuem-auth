@@ -10,33 +10,32 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 # Build the header-only library's network-independent unit tests and run them,
-# both in a normal Release build and under AddressSanitizer + UndefinedBehavior
-# Sanitizer.  qbuem-stack is pulled via FetchContent; OpenSSL is the only system
-# dependency.
+# both in a normal build and under AddressSanitizer + UndefinedBehaviorSanitizer.
+# qbuem-stack is pulled via FetchContent and uses C++23 <expected>, so the build
+# uses GCC 13 (ubuntu-24.04 default) — clang+libstdc++ on the runner lacks it.
+# liburing-dev + libssl-dev are the only system dependencies.
 jobs:
   test:
     name: ${{ matrix.label }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { label: "Release · Clang 18",   flags: "-O2" }
-          - { label: "ASan+UBSan · Clang 18", flags: "-fsanitize=address,undefined -fno-omit-frame-pointer -g" }
+          - { label: "GCC 13",            flags: "" }
+          - { label: "GCC 13 · ASan+UBSan", flags: "-fsanitize=address,undefined -fno-omit-frame-pointer -g" }
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Clang 18 + OpenSSL
-        run: |
-          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s 18
-          sudo apt-get install -y libssl-dev
+      - name: Install dependencies
+        run: sudo apt-get update -q && sudo apt-get install -y liburing-dev libssl-dev
 
       - name: Configure
         run: >
           cmake -B build
           -DQBUEM_AUTH_BUILD_TESTS=ON
           -DCMAKE_BUILD_TYPE=Debug
-          -DCMAKE_CXX_COMPILER=clang++-18
+          -DCMAKE_CXX_COMPILER=g++
           -DCMAKE_CXX_FLAGS="${{ matrix.flags }}"
 
       - name: Build

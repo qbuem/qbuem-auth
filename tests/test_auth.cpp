@@ -10,6 +10,7 @@
 #include "auth/jwt.hpp"
 #include "auth/oauth.hpp" // also pulls in https_client.hpp
 
+#include <algorithm> // std::ranges::count
 #include <cstdio>
 #include <string>
 #include <string_view>
