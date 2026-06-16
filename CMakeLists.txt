@@ -38,3 +38,15 @@ target_link_libraries(qbuem_auth INTERFACE
     OpenSSL::Crypto
 )
 add_library(qbuem-auth::auth ALIAS qbuem_auth)
+
+# ── Tests ─────────────────────────────────────────────────────────────────────
+# Network-independent unit tests: JWT issue/verify, JSON-string decoding,
+# chunked transfer-decoding, URL parsing, OAuth query/JSON parsing, CSRF state.
+option(QBUEM_AUTH_BUILD_TESTS "Build qbuem-auth tests" OFF)
+if(QBUEM_AUTH_BUILD_TESTS)
+    enable_testing()
+    add_executable(test_auth tests/test_auth.cpp)
+    target_link_libraries(test_auth PRIVATE qbuem-auth::auth)
+    target_compile_features(test_auth PRIVATE cxx_std_23)
+    add_test(NAME auth_unit COMMAND test_auth)
+endif()

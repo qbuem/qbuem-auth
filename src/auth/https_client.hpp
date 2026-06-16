@@ -18,6 +18,7 @@
 #include <openssl/bio.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <openssl/x509v3.h> // X509_CHECK_FLAG_* for hostname verification
 
 #include <algorithm>
 #include <array>
@@ -206,6 +207,45 @@ private:
 //   reusable=false → Read until EOF or error, connection discarded
 // nullopt → Transmission failed (stale connection detected → triggers reconnect)
 
+// Response-size guards.  Without them a malicious or buggy peer (reachable now
+// that the connection is authenticated, but also via a compromised upstream)
+// could stream headers or a body forever and exhaust memory.
+inline constexpr size_t kMaxHeaderBytes = 64 * 1024;        // 64 KiB of headers
+inline constexpr size_t kMaxBodyBytes   = 32 * 1024 * 1024; // 32 MiB body cap
+
+// ── Chunked transfer-encoding decoder (RFC 7230 §4.1) ────────────────────────
+// Pure function over an in-memory buffer so it is unit-testable without a socket.
+// Decodes `raw` (the bytes after the response headers) into `out`.
+enum class ChunkResult { Complete, NeedMore, Error };
+
+[[nodiscard]] inline ChunkResult
+decode_chunked(std::string_view raw, std::string& out, size_t max_body) {
+    out.clear();
+    size_t pos = 0;
+    while (true) {
+        const size_t line_end = raw.find("\r\n", pos);
+        if (line_end == std::string_view::npos) return ChunkResult::NeedMore;
+        // Chunk size is hex, optionally followed by ';ext'.
+        size_t hex_end = line_end;
+        if (const size_t semi = raw.find(';', pos);
+            semi != std::string_view::npos && semi < line_end)
+            hex_end = semi;
+        size_t chunk_size = 0;
+        const auto [p, ec] =
+            std::from_chars(raw.data() + pos, raw.data() + hex_end, chunk_size, 16);
+        if (ec != std::errc{} || p != raw.data() + hex_end)
+            return ChunkResult::Error;
+        pos = line_end + 2;
+        if (chunk_size == 0) return ChunkResult::Complete;  // terminal chunk
+        if (out.size() + chunk_size > max_body) return ChunkResult::Error;
+        if (raw.size() < pos + chunk_size + 2) return ChunkResult::NeedMore;
+        out.append(raw.substr(pos, chunk_size));
+        pos += chunk_size;
+        if (raw.compare(pos, 2, "\r\n") != 0) return ChunkResult::Error;
+        pos += 2;
+    }
+}
+
 [[nodiscard]] inline std::optional<std::pair<Response, bool>>
 do_request(BIO*             bio,
            std::string_view host,
@@ -239,6 +279,8 @@ do_request(BIO*             bio,
         if (n <= 0) return std::nullopt;
         raw.append(buf, static_cast<size_t>(n));
         sep = raw.find("\r\n\r\n");
+        if (sep == std::string::npos && raw.size() > kMaxHeaderBytes)
+            return std::nullopt;  // header section too large → abort
     }
 
     // ── Status code parsing ──────────────────────────────────────────────────
@@ -290,10 +332,38 @@ do_request(BIO*             bio,
         }
     }
 
-    // ── Remove headers in-place; move remaining bytes into body ─────────────
+    // ── Detect chunked transfer-encoding (takes precedence over Content-Length) ─
+    bool chunked = false;
+    if (auto it = resp.headers.find("transfer-encoding"); it != resp.headers.end()) {
+        std::string te = it->second;
+        std::transform(te.begin(), te.end(), te.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        chunked = te.find("chunked") != std::string::npos;
+    }
+
+    // ── Remove headers in-place; remaining bytes are the start of the body ──────
     raw.erase(0, sep + 4);
 
+    if (chunked) {
+        // Decode incrementally: parse what we have, read more on NeedMore.
+        std::string body;
+        while (true) {
+            auto st = decode_chunked(raw, body, kMaxBodyBytes);
+            if (st == ChunkResult::Complete) break;
+            if (st == ChunkResult::Error)    return std::nullopt;
+            const size_t before = raw.size();
+            int n = BIO_read(bio, buf, sizeof(buf));
+            if (n <= 0) return std::nullopt;          // truncated chunked stream
+            raw.append(buf, static_cast<size_t>(n));
+            if (raw.size() == before) return std::nullopt;
+            if (raw.size() > kMaxBodyBytes + kMaxHeaderBytes) return std::nullopt;
+        }
+        resp.body = std::move(body);
+        return std::pair{std::move(resp), true};      // keep-alive reusable
+    }
+
     if (content_length != std::string::npos) {
+        if (content_length > kMaxBodyBytes) return std::nullopt;  // oversized body
         // Content-Length present: read exactly that many bytes; connection reusable
         while (raw.size() < content_length) {
             int n = BIO_read(bio, buf,
@@ -303,14 +373,16 @@ do_request(BIO*             bio,
         }
         resp.body = std::move(raw);
         return std::pair{std::move(resp), true};
-    } else {
-        // No Content-Length: read until EOF (chunked or close); connection not reusable
-        int n;
-        while ((n = BIO_read(bio, buf, sizeof(buf))) > 0)
-            raw.append(buf, static_cast<size_t>(n));
-        resp.body = std::move(raw);
-        return std::pair{std::move(resp), false};
     }
+
+    // No Content-Length and not chunked: read until EOF (connection close); not reusable.
+    int n;
+    while ((n = BIO_read(bio, buf, sizeof(buf))) > 0) {
+        raw.append(buf, static_cast<size_t>(n));
+        if (raw.size() > kMaxBodyBytes) return std::nullopt;  // unbounded body guard
+    }
+    resp.body = std::move(raw);
+    return std::pair{std::move(resp), false};
 }
 
 // ── Connection lifecycle management ──────────────────────────────────────────
@@ -361,11 +433,30 @@ do_request(BIO*             bio,
     SSL_set_mode(ssl, SSL_MODE_AUTO_RETRY);
     const std::string host_str{host};
     SSL_set_tlsext_host_name(ssl, host_str.c_str());
+
+    // SECURITY (critical): verify the server certificate actually matches the
+    // host we intend to reach.  SNI (above) only tells the server which cert to
+    // present — it does NOT validate the returned cert.  SSL_VERIFY_PEER alone
+    // checks the chain but NOT the hostname, so without SSL_set1_host() any party
+    // holding any valid CA-issued certificate could transparently MITM these
+    // connections — which carry OAuth authorization codes and access tokens.
+    // SSL_set1_host() makes the TLS handshake fail on a hostname mismatch.
+    SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+    if (SSL_set1_host(ssl, host_str.c_str()) != 1) {
+        BIO_free_all(bio);
+        return {0, "SSL_set1_host failed", {}};
+    }
     BIO_set_conn_hostname(bio, pool_key.c_str());
 
     if (BIO_do_connect(bio) <= 0 || BIO_do_handshake(bio) <= 0) {
         BIO_free_all(bio);
-        return {0, "connect/handshake failed", {}};
+        return {0, "connect/TLS handshake failed", {}};
+    }
+
+    // Defense in depth: confirm chain + hostname verification actually passed.
+    if (const long vr = SSL_get_verify_result(ssl); vr != X509_V_OK) {
+        BIO_free_all(bio);
+        return {0, std::format("TLS certificate verification failed ({})", vr), {}};
     }
 
     if (auto resp = try_conn(bio)) return std::move(*resp);
