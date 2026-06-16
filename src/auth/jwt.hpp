@@ -20,11 +20,14 @@
 #include <qbuem/crypto/base64.hpp>
 #include <qbuem/crypto/hmac.hpp>
 #include <qbuem/crypto/random.hpp>
+#include <qbuem/crypto/sha256.hpp> // key derivation from JWT_SECRET
 #include <qbuem/crypto.hpp>       // constant_time_equal
 
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <format>
 #include <optional>
 #include <span>
@@ -57,16 +60,23 @@ struct Claims {
 // ── Secret key (256-bit, generated once at process startup) ───────────────────
 
 [[nodiscard]] inline std::span<const uint8_t> secret_bytes() noexcept {
-    // JWT_SECRET env var takes priority; otherwise CSPRNG
-    static const auto key = []() -> std::array<uint8_t, 32> {
-        if (const char* env = std::getenv("JWT_SECRET"); env) {
-            std::array<uint8_t, 32> k{};
-            auto len = std::min(std::strlen(env), k.size());
-            std::memcpy(k.data(), env, len);
-            return k;
+    // JWT_SECRET env var takes priority; otherwise a per-process CSPRNG key.
+    static const std::array<uint8_t, 32> key = []() -> std::array<uint8_t, 32> {
+        if (const char* env = std::getenv("JWT_SECRET"); env && *env) {
+            // Derive the 256-bit key by hashing the secret with SHA-256.  This
+            // accepts a secret of ANY length and gives a full-width key — unlike
+            // a raw memcpy, which silently truncated long secrets and zero-padded
+            // short ones (e.g. "secret" → 6 bytes of entropy + 26 zero bytes).
+            return qbuem::crypto::sha256(std::string_view{env});
         }
         auto r = qbuem::crypto::random_bytes<32>();
-        if (!r) return {};   // fallback: zero key (should not happen)
+        if (!r) {
+            // Fail closed: a zero / predictable key makes every token forgeable.
+            // Crashing is strictly safer than running with an insecure key.
+            std::fputs("qbuem-auth FATAL: CSPRNG unavailable; refusing to run "
+                       "with an insecure JWT signing key\n", stderr);
+            std::abort();
+        }
         return *r;
     }();
     return std::span<const uint8_t>{key.data(), key.size()};
@@ -137,38 +147,99 @@ namespace detail {
         std::span<const uint8_t>{digest.data(), digest.size()}, false);
 }
 
-// Extract a string field from payload JSON — handles JSON escape sequences fully
+// Append Unicode code point `cp` to `out` as UTF-8.
+inline void append_utf8(std::string& out, unsigned cp) {
+    if (cp <= 0x7F) {
+        out += static_cast<char>(cp);
+    } else if (cp <= 0x7FF) {
+        out += static_cast<char>(0xC0 | (cp >> 6));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else if (cp <= 0xFFFF) {
+        out += static_cast<char>(0xE0 | (cp >> 12));
+        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else {
+        out += static_cast<char>(0xF0 | (cp >> 18));
+        out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    }
+}
+
+// Parse the 4 hex digits at json[pos..pos+4). Returns -1 on bad/short hex.
+[[nodiscard]] inline int hex4(std::string_view json, size_t pos) {
+    if (pos + 4 > json.size()) return -1;
+    int v = 0;
+    for (int i = 0; i < 4; ++i) {
+        const char c = json[pos + i];
+        v <<= 4;
+        if (c >= '0' && c <= '9')      v |= c - '0';
+        else if (c >= 'a' && c <= 'f') v |= c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') v |= c - 'A' + 10;
+        else return -1;
+    }
+    return v;
+}
+
+// Decode a JSON string body starting at json[pos] (the first char AFTER the
+// opening quote), stopping at the unescaped closing quote.  Handles every
+// RFC 8259 escape including \uXXXX surrogate PAIRS; a lone/unpaired surrogate
+// becomes U+FFFD so the result is always valid UTF-8.  Shared by jwt and oauth.
+[[nodiscard]] inline std::string decode_json_string_body(std::string_view json,
+                                                         size_t pos) {
+    std::string out;
+    while (pos < json.size()) {
+        const char c = json[pos];
+        if (c == '"') break;
+        if (c != '\\') { out += c; ++pos; continue; }
+        if (pos + 1 >= json.size()) break;          // trailing backslash
+        const char e = json[pos + 1];
+        switch (e) {
+            case '"':  out += '"';  pos += 2; break;
+            case '\\': out += '\\'; pos += 2; break;
+            case '/':  out += '/';  pos += 2; break;
+            case 'n':  out += '\n'; pos += 2; break;
+            case 'r':  out += '\r'; pos += 2; break;
+            case 't':  out += '\t'; pos += 2; break;
+            case 'b':  out += '\b'; pos += 2; break;
+            case 'f':  out += '\f'; pos += 2; break;
+            case 'u': {
+                const int cp = hex4(json, pos + 2);
+                if (cp < 0) { out += e; pos += 2; break; } // malformed → literal
+                pos += 6;
+                if (cp >= 0xD800 && cp <= 0xDBFF) {        // high surrogate
+                    if (pos + 6 <= json.size() && json[pos] == '\\' &&
+                        json[pos + 1] == 'u') {
+                        const int lo = hex4(json, pos + 2);
+                        if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                            append_utf8(out, 0x10000u +
+                                ((static_cast<unsigned>(cp) - 0xD800u) << 10) +
+                                (static_cast<unsigned>(lo) - 0xDC00u));
+                            pos += 6;
+                            break;
+                        }
+                    }
+                    append_utf8(out, 0xFFFDu);             // lone high surrogate
+                } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                    append_utf8(out, 0xFFFDu);             // lone low surrogate
+                } else {
+                    append_utf8(out, static_cast<unsigned>(cp));
+                }
+                break;
+            }
+            default: out += e; pos += 2; break;
+        }
+    }
+    return out;
+}
+
+// Extract a string field from payload JSON — handles JSON escape sequences fully.
 [[nodiscard]] inline std::string extract_str(std::string_view json,
                                               std::string_view key) {
     auto k = std::format(R"("{}":")", key);
     auto pos = json.find(k);
     if (pos == std::string_view::npos) return {};
-    pos += k.size();
-    std::string out;
-    bool escaped = false;
-    for (; pos < json.size(); ++pos) {
-        char c = json[pos];
-        if (escaped) {
-            // restore escaped character
-            switch (c) {
-                case '"':  out += '"';  break;
-                case '\\': out += '\\'; break;
-                case '/':  out += '/';  break;
-                case 'n':  out += '\n'; break;
-                case 'r':  out += '\r'; break;
-                case 't':  out += '\t'; break;
-                case 'b':  out += '\b'; break;
-                case 'f':  out += '\f'; break;
-                default:   out += c;    break;  // \uXXXX etc. approximated
-            }
-            escaped = false;
-            continue;
-        }
-        if (c == '\\') { escaped = true; continue; }
-        if (c == '"') break;
-        out += c;
-    }
-    return out;
+    return decode_json_string_body(json, pos + k.size());
 }
 
 [[nodiscard]] inline int64_t extract_int(std::string_view json,

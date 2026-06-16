@@ -99,28 +99,9 @@ parse_query(std::string_view qs) {
     auto k_str = std::format(R"("{}":")", key);
     auto pos   = json.find(k_str);
     if (pos != std::string_view::npos) {
-        pos += k_str.size();
-        std::string out;
-        while (pos < json.size() && json[pos] != '"') {
-            if (json[pos] == '\\' && pos + 1 < json.size()) {
-                ++pos;  // skip backslash
-                switch (json[pos]) {
-                    case '"':  out += '"';  break;
-                    case '\\': out += '\\'; break;
-                    case '/':  out += '/';  break;
-                    case 'n':  out += '\n'; break;
-                    case 'r':  out += '\r'; break;
-                    case 't':  out += '\t'; break;
-                    case 'b':  out += '\b'; break;
-                    case 'f':  out += '\f'; break;
-                    default:   out += json[pos]; break;  // \uXXXX etc. handled approximately
-                }
-            } else {
-                out += json[pos];
-            }
-            ++pos;
-        }
-        return out;
+        // Full escape handling (incl. \uXXXX surrogate pairs) via the shared
+        // decoder — providers may \u-escape non-ASCII names (e.g. Korean).
+        return jwt::detail::decode_json_string_body(json, pos + k_str.size());
     }
 
     // ── Scalar format: "key":value (number, boolean, null) ───────────────────
