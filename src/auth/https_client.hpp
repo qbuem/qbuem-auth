@@ -92,6 +92,11 @@ namespace detail {
         OpenSSL_add_all_algorithms();
         SSL_CTX* c = SSL_CTX_new(TLS_client_method());
         if (!c) return nullptr;
+        // Enforce a modern TLS floor regardless of the system OpenSSL defaults:
+        // refuse SSLv3 / TLS 1.0 / TLS 1.1 (POODLE/BEAST, broken MACs) so an active
+        // MITM cannot negotiate a downgrade on connections carrying OAuth codes and
+        // access tokens.
+        SSL_CTX_set_min_proto_version(c, TLS1_2_VERSION);
         SSL_CTX_set_default_verify_paths(c);
         SSL_CTX_set_verify(c, SSL_VERIFY_PEER, nullptr);
         return c;
